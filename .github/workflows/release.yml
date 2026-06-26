@@ -1,0 +1,43 @@
+name: release
+
+# Cuts a release automatically when you push a version tag, e.g.:
+#   git tag v1.1
+#   git push origin v1.1
+# It cross-compiles every desktop binary, stamps the tag as the version, and
+# publishes them on the GitHub release — no manual building or uploading.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+          check-latest: true
+
+      - name: Build binaries
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          LD="-s -w -X github.com/khalid-src/corv-client/internal/version.Version=${VERSION}"
+          mkdir -p dist
+          GOOS=windows GOARCH=amd64 go build -ldflags "$LD" -o dist/corv-windows-amd64.exe ./cmd/corv
+          GOOS=linux   GOARCH=amd64 go build -ldflags "$LD" -o dist/corv-linux-amd64       ./cmd/corv
+          GOOS=linux   GOARCH=arm64 go build -ldflags "$LD" -o dist/corv-linux-arm64       ./cmd/corv
+          GOOS=darwin  GOARCH=amd64 go build -ldflags "$LD" -o dist/corv-darwin-amd64      ./cmd/corv
+          GOOS=darwin  GOARCH=arm64 go build -ldflags "$LD" -o dist/corv-darwin-arm64      ./cmd/corv
+          (cd dist && sha256sum corv-* > SHA256SUMS)
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

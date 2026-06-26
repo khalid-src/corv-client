@@ -1,0 +1,13 @@
+# Build outputs
+bin/
+dist/
+*.exe
+
+# Editor / OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs and local runtime state
+*.log
