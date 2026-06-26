@@ -1,0 +1,4 @@
+# Normalize all text files to LF in the repository and working tree.
+# Keeps the repo clean across Windows/macOS/Linux contributors.
+* text=auto eol=lf
+*.go text eol=lf
