@@ -1,6 +1,9 @@
 package tui
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -9,8 +12,13 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/khalid-src/corv-client/internal/profile"
+	"github.com/khalid-src/corv-client/internal/statelock"
 	"github.com/khalid-src/corv-client/internal/vault"
 )
+
+var saveProfileRegistry = func(store *profile.Store, reg profile.Registry) error {
+	return store.Save(reg)
+}
 
 // form field indices.
 const (
@@ -212,37 +220,82 @@ func (m *model) saveForm() error {
 		return err
 	}
 
-	reg, err := m.store.Load()
-	if err != nil {
-		return err
-	}
-
-	var existing profile.Profile
-	var hadExisting bool
-	if m.form.editName != "" {
-		existing, hadExisting = reg.Get(m.form.editName)
-		if m.form.editName != name { // rename: drop old key + secret
-			reg.Remove(m.form.editName)
-			if existing.SecretRef != "" {
-				_ = m.secrets.Delete(existing.SecretRef)
-				existing.SecretRef = ""
-			}
-		}
-	}
-
-	if hadExisting && existing.SecretRef != "" {
-		p.SecretRef = existing.SecretRef
-	}
-	if password != "" || passphrase != "" {
-		p.SecretRef = "profile:" + name
-		if err := m.secrets.Set(p.SecretRef, vault.Secret{Password: password, Passphrase: passphrase}); err != nil {
+	return statelock.WithLock(func() error {
+		reg, err := m.store.Load()
+		if err != nil {
 			return err
 		}
+
+		var existing profile.Profile
+		var hadExisting bool
+		if m.form.editName != "" {
+			existing, hadExisting = reg.Get(m.form.editName)
+			if m.form.editName != name {
+				if _, occupied := reg.Get(name); occupied {
+					return fmt.Errorf("connection %q already exists", name)
+				}
+				reg.Remove(m.form.editName)
+			}
+		}
+
+		oldRef := existing.SecretRef
+		var existingSecret vault.Secret
+		if oldRef != "" {
+			secret, ok, err := m.secrets.Get(oldRef)
+			if err != nil {
+				return fmt.Errorf("read stored credentials for %q: %w", m.form.editName, err)
+			}
+			if !ok {
+				return fmt.Errorf("stored credentials for %q were not found", m.form.editName)
+			}
+			existingSecret = secret
+		}
+
+		if hadExisting && existing.SecretRef != "" {
+			p.SecretRef = existing.SecretRef
+		}
+		secretChanged := password != "" || passphrase != ""
+		refChanged := oldRef != "" && oldRef != "profile:"+name
+		if secretChanged || refChanged {
+			if password != "" {
+				existingSecret.Password = password
+			}
+			if passphrase != "" {
+				existingSecret.Passphrase = passphrase
+			}
+			newRef, err := uniqueSecretRef(name)
+			if err != nil {
+				return err
+			}
+			p.SecretRef = newRef
+			if err := m.secrets.Set(p.SecretRef, existingSecret); err != nil {
+				return err
+			}
+		}
+		if err := reg.Set(p); err != nil {
+			return err
+		}
+		if err := saveProfileRegistry(m.store, reg); err != nil {
+			if p.SecretRef != oldRef {
+				_ = m.secrets.Delete(p.SecretRef)
+			}
+			return err
+		}
+		if oldRef != "" && oldRef != p.SecretRef {
+			if err := m.secrets.Delete(oldRef); err != nil {
+				return fmt.Errorf("remove old credentials for %q: %w", m.form.editName, err)
+			}
+		}
+		return nil
+	})
+}
+
+func uniqueSecretRef(name string) (string, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", fmt.Errorf("generate credential reference: %w", err)
 	}
-	if err := reg.Set(p); err != nil {
-		return err
-	}
-	return m.store.Save(reg)
+	return "profile:" + name + ":" + hex.EncodeToString(id[:]), nil
 }
 
 func validateProfile(p profile.Profile) error {

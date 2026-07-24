@@ -1,9 +1,12 @@
 package broker
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -19,6 +22,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/khalid-src/corv-client/internal/audit"
 	"github.com/khalid-src/corv-client/internal/paths"
 	"github.com/khalid-src/corv-client/internal/profile"
 	"github.com/khalid-src/corv-client/internal/sshconn"
@@ -31,6 +35,141 @@ type testSSHServer struct {
 	hostKey ssh.PublicKey
 	dials   *atomic.Int32
 	cleanup func()
+}
+
+func TestStatusSnapshotCountsRunningJobs(t *testing.T) {
+	running := newJob("running", "fingerprint")
+	done := newJob("done", "fingerprint")
+	done.mu.Lock()
+	done.done = true
+	done.status = jobStatusDone
+	done.mu.Unlock()
+	s := &server{entries: map[string]*entry{
+		"web": {
+			conn:     &sshconn.Conn{},
+			target:   "deploy@example.com",
+			lastUsed: time.Now().Add(-3 * time.Second),
+			jobs:     map[string]*job{"running": running, "done": done},
+		},
+	}}
+
+	got := s.status()
+	if len(got) != 1 || got[0].Name != "web" || got[0].Target != "deploy@example.com" || got[0].RunningJobs != 1 {
+		t.Fatalf("status = %#v", got)
+	}
+	if got[0].IdleMS < 2500 || got[0].IdleMS > 5000 {
+		t.Fatalf("idle = %dms", got[0].IdleMS)
+	}
+}
+
+func TestClientStatusDoesNotStartBroker(t *testing.T) {
+	t.Setenv("CORV_HOME", t.TempDir())
+	originalSpawn := spawnBroker
+	spawned := false
+	spawnBroker = func(*Client) error {
+		spawned = true
+		return nil
+	}
+	t.Cleanup(func() { spawnBroker = originalSpawn })
+
+	running, connections, err := NewClient("unused").Status()
+	if err != nil || running || len(connections) != 0 || spawned {
+		t.Fatalf("running=%v connections=%#v spawned=%v err=%v", running, connections, spawned, err)
+	}
+}
+
+func TestClientStatusTreatsUnsupportedOperationAsIncompatible(t *testing.T) {
+	t.Setenv("CORV_HOME", t.TempDir())
+	ln, addr, err := listenBroker()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = ln.Close()
+		cleanupBroker(addr)
+	})
+
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ep := endpoint{
+		Addr:       addr,
+		Token:      "test-token",
+		Version:    version.Version,
+		ExePath:    self,
+		ExeModTime: info.ModTime().UnixNano(),
+		ExeSize:    info.Size(),
+	}
+	if err := writeEndpoint(ep); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		if _, err := reader.ReadString('\n'); err != nil {
+			done <- err
+			return
+		}
+		var req Request
+		if err := json.NewDecoder(reader).Decode(&req); err != nil {
+			done <- err
+			return
+		}
+		if req.Op != OpStatus {
+			done <- fmt.Errorf("operation = %q, want %q", req.Op, OpStatus)
+			return
+		}
+		done <- json.NewEncoder(conn).Encode(Response{OK: false, Error: "unknown op"})
+	}()
+
+	running, connections, err := NewClient(self).Status()
+	if err != nil || running || len(connections) != 0 {
+		t.Fatalf("running=%v connections=%#v err=%v", running, connections, err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClientShutdownDoesNotStartBroker(t *testing.T) {
+	t.Setenv("CORV_HOME", t.TempDir())
+	path, err := endpointPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	originalSpawn := spawnBroker
+	spawned := false
+	spawnBroker = func(*Client) error {
+		spawned = true
+		return nil
+	}
+	t.Cleanup(func() { spawnBroker = originalSpawn })
+
+	if err := NewClient("unused").Shutdown(); err == nil {
+		t.Fatal("expected malformed endpoint error")
+	}
+	if spawned {
+		t.Fatal("shutdown started a broker")
+	}
 }
 
 func TestBrokerExecReusesConnection(t *testing.T) {
@@ -63,6 +202,114 @@ func TestBrokerExecReusesConnection(t *testing.T) {
 	if got := jobs.starts.Load(); got != 2 {
 		t.Fatalf("job starts = %d, want 2", got)
 	}
+}
+
+func TestCompletedResponsesUseFinalizedLogsConcurrently(t *testing.T) {
+	jobs := newAsyncJobTestHandler(func(command string) (string, int) {
+		return "marker:" + command + "\n", 0
+	})
+	jobs.tailOverride = func(string, string) string { return "" }
+	server := startBrokerTestSSHServerStdin(t, false, jobs.HandleStdin)
+	defer server.cleanup()
+	startBrokerForTest(t, server)
+
+	const commands = 64
+	errCh := make(chan error, commands)
+	var wg sync.WaitGroup
+	for i := range commands {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			command := fmt.Sprintf("command-%02d", i)
+			resp, err := NewClient("unused").Exec("srv1", []string{command})
+			if err != nil {
+				errCh <- err
+				return
+			}
+			want := "marker:" + command + "\n"
+			if !resp.OK || resp.Stdout != want {
+				errCh <- fmt.Errorf("%s response = %#v, want stdout %q", command, resp, want)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestCompletedLargeResponseKeepsFinalizedTail(t *testing.T) {
+	const final = "FINAL-MARKER\n"
+	large := "HEAD-MARKER\n" + strings.Repeat("x", 2<<20) + "\n" + final
+	jobs := newAsyncJobTestHandler(func(string) (string, int) { return large, 0 })
+	jobs.tailOverride = func(string, string) string { return "" }
+	server := startBrokerTestSSHServerStdin(t, false, jobs.HandleStdin)
+	defer server.cleanup()
+	startBrokerForTest(t, server)
+
+	resp, err := NewClient("unused").Exec("srv1", []string{"large-output"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK || !strings.Contains(resp.Stdout, "HEAD-MARKER") ||
+		!strings.Contains(resp.Stdout, final) || !strings.Contains(resp.Stdout, "hidden") {
+		t.Fatalf("large response lost finalized output: ok=%v bytes=%d tail=%q", resp.OK, len(resp.Stdout), lastBytes(resp.Stdout, 80))
+	}
+}
+
+func TestCompletedResponseIncludesOutputAfterLastDelta(t *testing.T) {
+	jobs := newAsyncJobTestHandler(func(string) (string, int) { return "first\n", 0 })
+	jobs.beforeRC = func(id string) {
+		jobs.mu.Lock()
+		jobs.logs[id] += "last\n"
+		jobs.mu.Unlock()
+	}
+	server := startBrokerTestSSHServerStdin(t, false, jobs.HandleStdin)
+	defer server.cleanup()
+	startBrokerForTest(t, server)
+
+	resp, err := NewClient("unused").Exec("srv1", []string{"late-output"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK || resp.Stdout != "first\nlast\n" {
+		t.Fatalf("completion response = %#v", resp)
+	}
+}
+
+func TestSlowFullLogTransferUsesLargerDeadline(t *testing.T) {
+	oldControlTimeout := controlOpTimeout
+	oldFullLogTimeout := fullLogTransferTimeout
+	controlOpTimeout = 50 * time.Millisecond
+	fullLogTransferTimeout = 500 * time.Millisecond
+	t.Cleanup(func() {
+		controlOpTimeout = oldControlTimeout
+		fullLogTransferTimeout = oldFullLogTimeout
+	})
+
+	jobs := newAsyncJobTestHandler(func(string) (string, int) { return "complete\n", 0 })
+	jobs.fullLogDelay = 150 * time.Millisecond
+	server := startBrokerTestSSHServerStdin(t, false, jobs.HandleStdin)
+	defer server.cleanup()
+	startBrokerForTest(t, server)
+
+	resp, err := NewClient("unused").Exec("srv1", []string{"slow-log-transfer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK || resp.Stdout != "complete\n" {
+		t.Fatalf("completion response = %#v", resp)
+	}
+}
+
+func lastBytes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
 }
 
 func TestBrokerProfileChangeDropsConnectionAndDetachedJob(t *testing.T) {
@@ -167,6 +414,7 @@ func TestStaleJobCannotOverwriteCurrentProfileRecord(t *testing.T) {
 	e := &entry{fingerprint: "new", jobs: map[string]*job{}}
 	e.cond = sync.NewCond(&e.mu)
 	current := newJob("deploy", "new")
+	current.key = jobKey("srv1", current.command)
 	current.started = true
 	current.startedAt = time.Now()
 	current.status = jobStatusRunning
@@ -174,7 +422,7 @@ func TestStaleJobCannotOverwriteCurrentProfileRecord(t *testing.T) {
 	stale.started = true
 	stale.startedAt = time.Now()
 	stale.status = jobStatusRunning
-	e.jobs[current.command] = current
+	e.jobs[current.key] = current
 
 	s := &server{
 		entries: map[string]*entry{"srv1": e},
@@ -244,7 +492,7 @@ func TestBrokerAsyncJobReattachesWithoutRestartAndAdvancesDelta(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Running || !resp.OK || resp.Stdout != "" {
+	if resp.Running || !resp.OK || resp.Stdout != "first\nsecond\n" {
 		t.Fatalf("second response = %#v", resp)
 	}
 	if got := jobs.starts.Load(); got != 1 {
@@ -339,7 +587,7 @@ func TestBrokerRestartReattachesWithoutRerunningJob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Running || !resp.OK || resp.Stdout != "" {
+	if resp.Running || !resp.OK || resp.Stdout != "start\nend\n" {
 		t.Fatalf("reattach response = %#v", resp)
 	}
 	if got := jobs.starts.Load(); got != 1 {
@@ -379,7 +627,7 @@ func TestBrokerDeltaDoesNotRepeatOrDropBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Stdout != "" || !resp.OK {
+	if resp.Stdout != "step1\nstep2\n" || !resp.OK {
 		t.Fatalf("second response = %#v", resp)
 	}
 }
@@ -529,7 +777,11 @@ func TestBrokerStartsLargeCommandThroughStdin(t *testing.T) {
 
 func TestBrokerLargeCompletedLogIsSavedTruncated(t *testing.T) {
 	t.Setenv("CORV_WAIT", "0s")
-	payload := strings.Repeat("x", maxLocalLogBytes+4096)
+	const headMarker = "HEAD-MARKER\n"
+	const tailMarker = "\nFINAL-TAIL-MARKER\n"
+	head := headMarker + strings.Repeat("h", retainedLogHeadBytes-len(headMarker))
+	tail := strings.Repeat("t", retainedLogTailBytes-len(tailMarker)) + tailMarker
+	payload := head + strings.Repeat("m", 4096+retainedLogFrameMargin) + tail
 	jobs := newAsyncJobTestHandler(func(string) (string, int) {
 		return payload, 0
 	})
@@ -544,9 +796,13 @@ func TestBrokerLargeCompletedLogIsSavedTruncated(t *testing.T) {
 	if resp.Running || resp.ExitCode != 0 || !resp.OK {
 		t.Fatalf("response = %#v", resp)
 	}
-	wantHighlight := fmt.Sprintf("Corv saved log was truncated at %d MiB", maxLocalLogBytes/(1024*1024))
+	wantHighlight := fmt.Sprintf("Corv retained log exceeded %d MiB; middle bytes were omitted", maxLocalLogBytes/(1024*1024))
 	if !slices.Contains(resp.Highlights, wantHighlight) {
 		t.Fatalf("highlights = %#v", resp.Highlights)
+	}
+	if !resp.Truncated || resp.OriginalBytes != int64(len(payload)) || resp.SavedBytes <= 0 ||
+		resp.SavedBytes > maxLocalLogBytes || !resp.OutputTruncated {
+		t.Fatalf("response metadata = %#v", resp)
 	}
 
 	p, err := paths.Default()
@@ -557,15 +813,43 @@ func TestBrokerLargeCompletedLogIsSavedTruncated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	marker := fmt.Sprintf("\n[Corv log truncated at %d MiB]\n", maxLocalLogBytes/(1024*1024))
-	if len(data) != maxLocalLogBytes+len(marker) {
-		t.Fatalf("saved log size = %d, want %d", len(data), maxLocalLogBytes+len(marker))
+	if len(data) > maxLocalLogBytes {
+		t.Fatalf("saved log size = %d, limit %d", len(data), maxLocalLogBytes)
 	}
-	if !bytes.Equal(data[:maxLocalLogBytes], []byte(payload[:maxLocalLogBytes])) {
-		t.Fatal("saved log prefix does not match remote output")
+	if !bytes.HasPrefix(data, []byte(head)) {
+		t.Fatal("saved log prefix does not match remote output head")
 	}
-	if string(data[maxLocalLogBytes:]) != marker {
-		t.Fatalf("saved log marker = %q", data[maxLocalLogBytes:])
+	if !bytes.HasSuffix(data, []byte(tail)) {
+		t.Fatal("saved log suffix does not match remote output tail")
+	}
+	if !bytes.Contains(data, []byte("bytes omitted")) {
+		t.Fatal("saved log has no omission marker")
+	}
+	metaData, err := os.ReadFile(filepath.Join(p.RunsDir, resp.RunID+".meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var metadata runMetadata
+	if err := json.Unmarshal(metaData, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata.OriginalBytes != int64(len(payload)) || metadata.SavedBytes != int64(len(data)) || !metadata.Truncated {
+		t.Fatalf("saved metadata = %#v", metadata)
+	}
+
+	outputResp, err := NewClient("unused").Output(resp.RunID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outputResp.OutputTruncated || outputResp.OriginalBytes != int64(len(payload)) ||
+		outputResp.SavedBytes != int64(len(data)) || outputResp.ReturnedBytes != int64(len(outputResp.Stdout)) {
+		t.Fatalf("output metadata = %#v", outputResp)
+	}
+	if !strings.Contains(outputResp.Stdout, headMarker) || !strings.Contains(outputResp.Stdout, tailMarker) {
+		t.Fatal("bounded output lost the retained head or tail marker")
+	}
+	if len(outputResp.Stdout) > maxInlineOutputBytes+1024 {
+		t.Fatalf("output returned %d bytes, budget %d", len(outputResp.Stdout), maxInlineOutputBytes)
 	}
 }
 
@@ -693,13 +977,17 @@ func TestBrokerCompletedCommandReturnsFullOutputUpToBudget(t *testing.T) {
 		t.Fatalf("inline output was not trimmed: %d bytes", len(execResp.Stdout))
 	}
 
-	// corv output returns the complete saved log.
+	// corv output applies the same agent-facing budget.
 	outputResp, err := client.Output(execResp.RunID, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if outputResp.Stdout != want {
-		t.Fatalf("corv output returned %d bytes, want full %d", len(outputResp.Stdout), len(want))
+	if !outputResp.OutputTruncated || !strings.Contains(outputResp.Stdout, "line(s) hidden") ||
+		!strings.Contains(outputResp.Stdout, "FIRST-LINE") || !strings.Contains(outputResp.Stdout, "LAST-LINE") {
+		t.Fatalf("corv output response = %#v", outputResp)
+	}
+	if len(outputResp.Stdout) >= len(want) || outputResp.ReturnedBytes != int64(len(outputResp.Stdout)) {
+		t.Fatalf("corv output returned %d bytes from %d", len(outputResp.Stdout), len(want))
 	}
 }
 
@@ -843,6 +1131,48 @@ func TestBrokerOutputReadsLegacyLogWithoutMetadata(t *testing.T) {
 	}
 }
 
+func TestBrokerOutputRecordsDetachedCompletion(t *testing.T) {
+	t.Setenv("CORV_HOME", t.TempDir())
+	p, err := paths.Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := audit.NewLog(p.AuditFile)
+	runID := "0000000000000000-ab"
+	started := time.Now().UTC().Add(-time.Minute)
+	finished := started.Add(30 * time.Second)
+	if err := log.Append(audit.Entry{
+		StartedAt: started,
+		Profile:   "srv1",
+		Command:   "deploy",
+		ExitCode:  75,
+		RunID:     runID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{audit: log}
+	if path := s.saveRunLog(runID, []byte("failed\n"), runMetadata{
+		ExitCode:   17,
+		OK:         false,
+		Connection: "srv1",
+		StartedAt:  started,
+		FinishedAt: finished,
+	}); path == "" {
+		t.Fatal("save run log failed")
+	}
+	resp := s.output(Request{RunID: runID})
+	if resp.ExitCode != 17 || resp.OK {
+		t.Fatalf("output response = %#v", resp)
+	}
+	entries, err := log.Read("", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[1].RunID != runID || entries[1].ExitCode != 17 {
+		t.Fatalf("audit entries = %#v", entries)
+	}
+}
+
 func TestBrokerLeavesRemoteLogWhenLocalSaveFails(t *testing.T) {
 	t.Setenv("CORV_WAIT", "0s")
 	jobs := newAsyncJobTestHandler(func(string) (string, int) {
@@ -890,7 +1220,7 @@ func TestBrokerLeavesRemoteLogWhenLocalSaveFails(t *testing.T) {
 	if !ok {
 		t.Fatal("completed job was removed from jobs.json")
 	}
-	if rec.RunID != first.RunID || rec.Status != jobStatusDone {
+	if rec.RunID != first.RunID || rec.Status != jobStatusFinalizePending {
 		t.Fatalf("persisted job = %#v", rec)
 	}
 
@@ -901,14 +1231,14 @@ func TestBrokerLeavesRemoteLogWhenLocalSaveFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if retry.Running || !retry.OK || retry.RunID == first.RunID {
+	if retry.Running || !retry.OK || retry.RunID != first.RunID || retry.Stdout != "keep me\n" {
 		t.Fatalf("retry response = %#v", retry)
 	}
-	if got := jobs.starts.Load(); got != 2 {
-		t.Fatalf("remote job started %d times, want 2", got)
+	if got := jobs.starts.Load(); got != 1 {
+		t.Fatalf("remote job started %d times, want 1", got)
 	}
-	if _, err := os.Stat(filepath.Join(p.RunsDir, retry.RunID+".log")); err != nil {
-		t.Fatalf("new run log missing after retry: %v", err)
+	if _, err := os.Stat(filepath.Join(p.RunsDir, first.RunID+".log")); err != nil {
+		t.Fatalf("run log missing after finalization retry: %v", err)
 	}
 }
 
@@ -1074,7 +1404,15 @@ func TestClientReplacesStaleBroker(t *testing.T) {
 	t.Cleanup(func() { version.Version = oldVersion })
 
 	oldErrc := make(chan error, 1)
-	go func() { oldErrc <- Serve() }()
+	var oldStopped atomic.Bool
+	go func() {
+		err := Serve()
+		oldStopped.Store(true)
+		oldErrc <- err
+	}()
+	oldProcessExited := brokerProcessExited
+	brokerProcessExited = func(int) (bool, error) { return oldStopped.Load(), nil }
+	t.Cleanup(func() { brokerProcessExited = oldProcessExited })
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -1137,6 +1475,101 @@ func TestClientReplacesStaleBroker(t *testing.T) {
 	}
 	if ep, ok := client.currentEndpoint(); !ok || ep.Version != version.Version {
 		t.Fatalf("current endpoint = %#v, ok=%v", ep, ok)
+	}
+}
+
+func TestBrokerReplacementWaitsForInflightHandler(t *testing.T) {
+	t.Setenv("CORV_HOME", t.TempDir())
+	t.Setenv("CORV_WAIT", "500ms")
+	resetBrokerTestHooks(t)
+
+	jobs := newConcurrentJobTestHandler()
+	sshServer := startBrokerTestSSHServerStdin(t, false, jobs.HandleStdin)
+	defer sshServer.cleanup()
+	writeBrokerTestProfile(t, sshServer)
+	testDialOptions = func(profile.Profile) sshconn.DialOptions {
+		return sshconn.DialOptions{
+			HostKey: ssh.FixedHostKey(sshServer.hostKey),
+			Auth:    []ssh.AuthMethod{ssh.Password("x")},
+		}
+	}
+
+	var oldStopped atomic.Bool
+	oldErrc := make(chan error, 1)
+	go func() {
+		err := Serve()
+		oldStopped.Store(true)
+		oldErrc <- err
+	}()
+	client := NewClient("unused")
+	deadline := time.Now().Add(2 * time.Second)
+	for !client.Running() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	execDone := make(chan struct{})
+	go func() {
+		_, _ = client.Exec("srv1", []string{"slow"})
+		close(execDone)
+	}()
+	select {
+	case <-jobs.slowStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow handler did not start")
+	}
+
+	ep, err := readEndpoint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ep.Version = "stale"
+	if err := writeEndpoint(ep); err != nil {
+		t.Fatal(err)
+	}
+
+	oldProcessExited := brokerProcessExited
+	brokerProcessExited = func(int) (bool, error) { return oldStopped.Load(), nil }
+	t.Cleanup(func() { brokerProcessExited = oldProcessExited })
+	oldSpawn := spawnBroker
+	freshErrc := make(chan error, 1)
+	spawnBroker = func(*Client) error {
+		if !oldStopped.Load() {
+			return errors.New("fresh broker spawned before old broker exited")
+		}
+		go func() { freshErrc <- Serve() }()
+		return nil
+	}
+	t.Cleanup(func() { spawnBroker = oldSpawn })
+
+	resp, err := client.request(Request{Op: OpPing})
+	if err != nil || !resp.OK {
+		t.Fatalf("replacement request: response=%#v err=%v", resp, err)
+	}
+	select {
+	case <-execDone:
+	default:
+		t.Fatal("old in-flight handler was not drained before replacement")
+	}
+	select {
+	case err := <-oldErrc:
+		if err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatal("old broker was still alive after replacement")
+	}
+	if _, ok := client.currentEndpoint(); !ok {
+		t.Fatal("old broker cleanup removed the fresh endpoint")
+	}
+
+	_ = client.Shutdown()
+	select {
+	case err := <-freshErrc:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("fresh broker did not stop")
 	}
 }
 
@@ -1214,7 +1647,9 @@ func TestEnrichJumpAuthFromSavedProfile(t *testing.T) {
 	s := &server{secrets: secrets}
 	jumps := []sshconn.JumpHost{{Host: "bastion"}}
 
-	sshconn.EnrichJumpChain(jumps, reg, s.jumpSecret)
+	if err := sshconn.EnrichJumpChain(jumps, reg, s.jumpSecret); err != nil {
+		t.Fatal(err)
+	}
 
 	if jumps[0].Host != "bastion.internal" || jumps[0].User != "ops" || jumps[0].Port != 2200 ||
 		jumps[0].IdentityFile != "id_bastion" || jumps[0].Password != "jump-password" || jumps[0].Passphrase != "jump-passphrase" {
@@ -1505,16 +1940,19 @@ func TestBrokerStartTimeoutIsUncertainAndNeverRetried(t *testing.T) {
 }
 
 type asyncJobTestHandler struct {
-	mu          sync.Mutex
-	starts      atomic.Int32
-	cleanups    atomic.Int32
-	rcAfter     atomic.Int32
-	rcCalls     atomic.Int32
-	logs        map[string]string
-	rcs         map[string]int
-	tailOffsets []int
-	tailSizes   []int
-	runFunc     func(string) (string, int)
+	mu           sync.Mutex
+	starts       atomic.Int32
+	cleanups     atomic.Int32
+	rcAfter      atomic.Int32
+	rcCalls      atomic.Int32
+	logs         map[string]string
+	rcs          map[string]int
+	tailOffsets  []int
+	tailSizes    []int
+	runFunc      func(string) (string, int)
+	tailOverride func(string, string) string
+	beforeRC     func(string)
+	fullLogDelay time.Duration
 }
 
 func newAsyncJobTestHandler(run func(string) (string, int)) *asyncJobTestHandler {
@@ -1562,6 +2000,9 @@ func (h *asyncJobTestHandler) HandleStdin(cmd string, stdin []byte) (string, int
 			return "", 0
 		}
 		out := log[offset-1:]
+		if h.tailOverride != nil {
+			out = h.tailOverride(id, out)
+		}
 		if limit := parseHeadLimit(cmd); limit > 0 && len(out) > limit {
 			out = out[:limit]
 		}
@@ -1572,6 +2013,9 @@ func (h *asyncJobTestHandler) HandleStdin(cmd string, stdin []byte) (string, int
 		return out, 0
 	case strings.Contains(cmd, ".rc") && strings.Contains(cmd, "cat"):
 		id := parseJobID(cmd)
+		if h.beforeRC != nil {
+			h.beforeRC(id)
+		}
 		if h.rcCalls.Add(1) < h.rcAfter.Load() {
 			return "", 0
 		}
@@ -1580,13 +2024,13 @@ func (h *asyncJobTestHandler) HandleStdin(cmd string, stdin []byte) (string, int
 		h.mu.Unlock()
 		return fmt.Sprintf("%d\n", code), 0
 	case strings.Contains(cmd, ".log") && strings.Contains(cmd, "cat"):
+		if h.fullLogDelay > 0 {
+			time.Sleep(h.fullLogDelay)
+		}
 		h.mu.Lock()
 		log := h.logs[parseJobID(cmd)]
 		h.mu.Unlock()
-		if len(log) > maxLocalLogBytes+1 {
-			log = log[:maxLocalLogBytes+1]
-		}
-		return log, 0
+		return frameTestLog(log), 0
 	case strings.Contains(cmd, "rm -f"):
 		id := parseJobID(cmd)
 		h.cleanups.Add(1)
@@ -1670,7 +2114,7 @@ func (h *concurrentJobTestHandler) HandleStdin(cmd string, stdin []byte) (string
 		h.mu.Lock()
 		log := h.logs[parseJobID(cmd)]
 		h.mu.Unlock()
-		return log, 0
+		return frameTestLog(log), 0
 	case strings.Contains(cmd, "rm -f"):
 		return "", 0
 	default:
@@ -1710,6 +2154,15 @@ func parseHeadLimit(cmd string) int {
 	var limit int
 	_, _ = fmt.Sscanf(m[1], "%d", &limit)
 	return limit
+}
+
+func frameTestLog(log string) string {
+	if len(log) <= maxLocalLogBytes {
+		return fmt.Sprintf("CORV_LOG_V1 %d %d 0\n%s", len(log), len(log), log)
+	}
+	return fmt.Sprintf("CORV_LOG_V1 %d %d %d\n%s%s",
+		len(log), retainedLogHeadBytes, retainedLogTailBytes,
+		log[:retainedLogHeadBytes], log[len(log)-retainedLogTailBytes:])
 }
 
 func loadPersistedTestJob(t *testing.T, profileName, command string) (jobRecord, bool) {

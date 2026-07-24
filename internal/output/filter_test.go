@@ -143,6 +143,14 @@ func TestLongLineCapped(t *testing.T) {
 	}
 }
 
+func TestUnboundedPreservesSavedLogSizedLine(t *testing.T) {
+	line := strings.Repeat("x", 9*1024*1024)
+	got := clean(Options{Unbounded: true}, line)
+	if len(strings.TrimSuffix(got, "\n")) != len(line) {
+		t.Fatalf("line length = %d, want %d", len(strings.TrimSuffix(got, "\n")), len(line))
+	}
+}
+
 func TestHiddenAndLinesCounts(t *testing.T) {
 	var sb strings.Builder
 	for i := 0; i < 10; i++ {

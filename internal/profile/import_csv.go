@@ -70,7 +70,6 @@ func ImportCSV(path string) ([]Imported, error) {
 
 	r := csv.NewReader(f)
 	r.FieldsPerRecord = -1 // tolerate ragged rows
-	r.TrimLeadingSpace = true
 
 	header, err := r.Read()
 	if err == io.EOF {
@@ -93,6 +92,12 @@ func ImportCSV(path string) ([]Imported, error) {
 	get := func(row []string, key string) string {
 		if i, ok := col[key]; ok && i < len(row) {
 			return strings.TrimSpace(row[i])
+		}
+		return ""
+	}
+	getSecret := func(row []string, key string) string {
+		if i, ok := col[key]; ok && i < len(row) {
+			return row[i]
 		}
 		return ""
 	}
@@ -149,8 +154,8 @@ func ImportCSV(path string) ([]Imported, error) {
 				IdentityFile: identity,
 				ProxyJump:    get(row, "jump"),
 			},
-			Password:    get(row, "password"),
-			Passphrase:  get(row, "passphrase"),
+			Password:    getSecret(row, "password"),
+			Passphrase:  getSecret(row, "passphrase"),
 			KeyMaterial: keyMaterial,
 		})
 	}

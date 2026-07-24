@@ -4,6 +4,7 @@
 package tui
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -15,9 +16,14 @@ import (
 
 	"github.com/khalid-src/corv-client/internal/audit"
 	"github.com/khalid-src/corv-client/internal/profile"
+	"github.com/khalid-src/corv-client/internal/statelock"
 	"github.com/khalid-src/corv-client/internal/vault"
 	"github.com/khalid-src/corv-client/internal/version"
 )
+
+var deleteStoredSecret = func(store *vault.Store, ref string) error {
+	return store.Delete(ref)
+}
 
 type screen int
 
@@ -41,12 +47,13 @@ var raven = []string{
 // Run launches the interactive UI and blocks until the user quits or
 // chooses a connection. Returns the chosen connection name (empty if the user
 // quit without selecting).
-func Run(store *profile.Store, secrets *vault.Store, log *audit.Log, stdin io.Reader, stdout io.Writer, notice string) (string, error) {
+func Run(store *profile.Store, secrets *vault.Store, log *audit.Log, stdin io.Reader, stdout io.Writer, notice string, testConnection func(string) (string, error)) (string, error) {
 	m, err := newModel(store, secrets, log)
 	if err != nil {
 		return "", err
 	}
 	m.notice = notice
+	m.testConnection = testConnection
 	// Seed the real terminal size up front. Bubble Tea normally delivers it via
 	// WindowSizeMsg, but over some terminals and SSH PTYs that first message is
 	// delayed or never arrives, leaving the model at its 80x24 fallback and the
@@ -107,7 +114,13 @@ type model struct {
 	err     string
 	notice  string
 
-	connectName string
+	connectName    string
+	testConnection func(string) (string, error)
+}
+
+type connectionTestMsg struct {
+	message string
+	err     error
 }
 
 func newModel(store *profile.Store, secrets *vault.Store, log *audit.Log) (model, error) {
@@ -138,6 +151,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
+	case connectionTestMsg:
+		m.clearStatus()
+		if msg.err != nil {
+			m.err = msg.err.Error()
+		} else {
+			m.message = msg.message
+		}
+		return m, nil
 	}
 
 	switch m.screen {
@@ -322,6 +343,15 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.startImport()
 	case "l":
 		return m, m.startLogs("")
+	case "t":
+		if p, ok := m.selected(); ok && m.testConnection != nil {
+			m.clearStatus()
+			m.message = "testing " + p.Name + "..."
+			return m, func() tea.Msg {
+				message, err := m.testConnection(p.Name)
+				return connectionTestMsg{message: message, err: err}
+			}
+		}
 	case "?":
 		m.screen = screenInfo
 		m.clearStatus()
@@ -484,6 +514,7 @@ func footerChipList() []string {
 		chip("d", "Delete"),
 		chip("i", "Import"),
 		chip("l", "Logs"),
+		chip("t", "Test"),
 		chip("?", "Info"),
 		chip("q", "Quit"),
 	}
@@ -566,7 +597,10 @@ func (m model) viewInfo() string {
 	body := titleStyle.Render("Corv") + "\n\n" +
 		subtleStyle.Render("The SSH client for AI agents and humans") + "\n\n" +
 		"Version: " + focusLabel.Render(version.Version) + "\n" +
-		"License: " + focusLabel.Render("Apache-2.0") + "\n\n" +
+		"License: " + focusLabel.Render("Apache-2.0") + "\n" +
+		"Maintainer: " + focusLabel.Render("khalid-src") + "\n" +
+		"Contact: " + focusLabel.Render("hi.khalid@protonmail.com") + "\n" +
+		"Repo: " + focusLabel.Render("github.com/khalid-src/corv-client") + "\n\n" +
 		dimStyle.Render("Stored credentials stay local. Audit and run logs may contain command text or remote output.") + "\n" +
 		"\n" + focusLabel.Render("Disclaimer") + "\n" +
 		subtleStyle.Width(w).Render(disclaimer)
@@ -608,17 +642,25 @@ func (m *model) clearStatus() {
 }
 
 func (m model) deleteSelected(name string) (model, error) {
-	reg, err := m.store.Load()
+	err := statelock.WithLock(func() error {
+		reg, err := m.store.Load()
+		if err != nil {
+			return err
+		}
+		p, _ := reg.Get(name)
+		reg.Remove(name)
+		if err := m.store.Save(reg); err != nil {
+			return err
+		}
+		if p.SecretRef != "" {
+			if err := deleteStoredSecret(m.secrets, p.SecretRef); err != nil {
+				return fmt.Errorf("remove stored credentials for %q: %w", name, err)
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return m, err
-	}
-	p, _ := reg.Get(name)
-	reg.Remove(name)
-	if err := m.store.Save(reg); err != nil {
-		return m, err
-	}
-	if p.SecretRef != "" {
-		_ = m.secrets.Delete(p.SecretRef)
 	}
 	m.reload()
 	return m, nil

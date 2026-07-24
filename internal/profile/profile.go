@@ -14,6 +14,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/khalid-src/corv-client/internal/atomicfile"
 )
 
 // Sealer encrypts and decrypts profile store bytes. The connection file is
@@ -22,6 +24,10 @@ type Sealer interface {
 	Seal([]byte) ([]byte, error)
 	Open([]byte) ([]byte, error)
 }
+
+// ErrConfigUnreadable reports that an encrypted config file could not be
+// opened. The key may be unavailable or incorrect, or the file may be damaged.
+var ErrConfigUnreadable = errors.New("encrypted connection store cannot be read")
 
 // nameRE constrains profile names to a safe, shell- and filename-friendly
 // set so a name can be used unquoted on a command line and as a key.
@@ -54,13 +60,18 @@ type Store struct {
 	sealer Sealer
 }
 
+var (
+	writeFile  = atomicfile.Write
+	removeFile = os.Remove
+)
+
 // NewStore returns a Store backed by the file at path.
 func NewStore(path string, sealer Sealer) *Store {
 	return &Store{path: path, sealer: sealer}
 }
 
 // Load reads the registry from disk. A missing or empty file is treated as
-// an empty registry rather than an error, so first run just works.
+// an empty registry rather than an error, so the first run starts clean.
 func (s *Store) Load() (Registry, error) {
 	data, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) || (err == nil && len(data) == 0) {
@@ -75,7 +86,7 @@ func (s *Store) Load() (Registry, error) {
 		}
 		opened, err := s.sealer.Open(bytes.TrimSpace(data))
 		if err != nil {
-			return Registry{}, fmt.Errorf("decrypt config: %w", err)
+			return Registry{}, fmt.Errorf("%w: %v", ErrConfigUnreadable, err)
 		}
 		data = opened
 	}
@@ -97,7 +108,7 @@ func (s *Store) Load() (Registry, error) {
 	return reg, nil
 }
 
-// Save writes the registry atomically-ish with restrictive permissions.
+// Save writes the registry with restrictive permissions.
 func (s *Store) Save(reg Registry) error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return err
@@ -114,7 +125,16 @@ func (s *Store) Save(reg Registry) error {
 	if err != nil {
 		return fmt.Errorf("encrypt config: %w", err)
 	}
-	return os.WriteFile(s.path, data, 0o600)
+	return writeFile(s.path, data, 0o600)
+}
+
+// Remove deletes the backing config file, discarding every saved connection.
+// A missing file is not an error.
+func (s *Store) Remove() error {
+	if err := removeFile(s.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // Set validates and inserts (or replaces) a profile keyed by name.

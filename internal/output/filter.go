@@ -1,10 +1,10 @@
 // Package output is the output broker. Raw terminal output is
-// hostile to an LLM: progress bars redraw the same line thousands of times
+// poorly suited to an LLM: progress bars redraw the same line thousands of times
 // with carriage returns, colour escapes add tokens with no meaning, and a
 // noisy command can bury the one line that matters under megabytes of
 // scrollback.
 //
-// Filter turns that stream into something an agent can actually read:
+// Filter turns that stream into something an agent can read reliably:
 //
 //   - carriage returns and backspaces are resolved so a progress bar
 //     collapses to its final frame instead of thousands of lines;
@@ -33,9 +33,9 @@ const (
 	// unboundedMaxLineBytes caps a single line when rendering a complete saved
 	// log (Unbounded mode). The input is an already-bounded byte slice read
 	// from disk, so there is no streaming-memory risk; this only guards a
-	// pathological allocation and sits well above the largest saved log, so a
+	// pathological allocation and matches the largest saved log, so a
 	// long single-line log is returned in full rather than clipped at 64 KiB.
-	unboundedMaxLineBytes = 8 * 1024 * 1024
+	unboundedMaxLineBytes = 20 * 1024 * 1024
 )
 
 // Options controls how much of the stream is retained.

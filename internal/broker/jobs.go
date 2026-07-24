@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -21,25 +22,27 @@ import (
 )
 
 const (
-	maxDeltaBytes    = 512 * 1024
-	maxLocalLogBytes = 20 * 1024 * 1024
-	// maxInlineOutputBytes bounds the output returned inline for a finished
-	// command; larger output is trimmed middle-out and the full log stays
-	// available via corv output.
-	maxInlineOutputBytes = 64 * 1024
-	jobTTL               = 24 * time.Hour
-	defaultWait          = 60 * time.Second
-	maxWait              = 2 * time.Minute
-	pollEvery            = time.Second
-	remoteJobDir         = "${TMPDIR:-/tmp}/corv-jobs-$(id -u)"
+	maxDeltaBytes          = 512 * 1024
+	maxLocalLogBytes       = 20 * 1024 * 1024
+	maxInlineOutputBytes   = 32 * 1024
+	maxRunningOutputBytes  = 16 * 1024
+	retainedLogHeadBytes   = 4 * 1024 * 1024
+	retainedLogFrameMargin = 256
+	retainedLogTailBytes   = maxLocalLogBytes - retainedLogHeadBytes - retainedLogFrameMargin
+	jobTTL                 = 24 * time.Hour
+	defaultWait            = 60 * time.Second
+	maxWait                = 2 * time.Minute
+	pollEvery              = time.Second
+	remoteJobDir           = "${TMPDIR:-/tmp}/corv-jobs-$(id -u)"
 )
 
 const (
-	jobStatusPending  = "pending"
-	jobStatusStarting = "starting"
-	jobStatusRunning  = "running"
-	jobStatusFailed   = "failed"
-	jobStatusDone     = "done"
+	jobStatusPending         = "pending"
+	jobStatusStarting        = "starting"
+	jobStatusRunning         = "running"
+	jobStatusFinalizePending = "finalize_pending"
+	jobStatusFailed          = "failed"
+	jobStatusDone            = "done"
 )
 
 type job struct {
@@ -47,6 +50,7 @@ type job struct {
 	pollMu      sync.Mutex
 	mu          sync.Mutex
 	id          string
+	key         string
 	command     string
 	fingerprint string
 	offset      int64
@@ -86,6 +90,12 @@ func (j *job) failed() bool {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.status == jobStatusFailed
+}
+
+func (j *job) finalizePending() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.status == jobStatusFinalizePending
 }
 
 func randomHex(n int) string {
@@ -301,47 +311,57 @@ func (s *server) finishJobPoll(e *entry, p profile.Profile, reg profile.Registry
 		brokerLog.Printf("persist progress for run %s: %v", runID, err)
 	}
 
-	cleaned := output.Clean([]byte(delta))
-	highlights := output.Signals(cleaned, 8)
-
 	if done {
-		// A finished command returns its output in full up to a generous byte
-		// budget, so callers rarely need a second corv output call; only large
-		// output is trimmed middle-out.
-		bounded := output.Bound(cleaned, output.Options{MaxBytes: maxInlineOutputBytes})
-		localPath, truncated := s.copyAndCleanupRemote(e, p, reg, runID, runMetadata{
+		localPath, retained := s.copyAndCleanupRemote(e, p, reg, runID, runMetadata{
 			ExitCode:   exitCode,
 			OK:         exitCode == 0,
 			Connection: p.Name,
 			StartedAt:  startedAt.UTC(),
 			FinishedAt: finishedAt,
 		})
-		if truncated {
-			highlights = append(highlights, fmt.Sprintf("Corv saved log was truncated at %d MiB", maxLocalLogBytes/(1024*1024)))
+		cleaned := output.Clean(retained.data)
+		rendered := output.Bound(cleaned, output.Options{MaxBytes: maxInlineOutputBytes})
+		highlights := output.Signals(cleaned, 8)
+		if retained.truncated {
+			highlights = append(highlights, fmt.Sprintf("Corv retained log exceeded %d MiB; middle bytes were omitted", maxLocalLogBytes/(1024*1024)))
 		}
 		if localPath == "" {
+			j.mu.Lock()
+			j.status = jobStatusFinalizePending
+			j.mu.Unlock()
+			if err := s.savePersistedJob(p.Name, j); err != nil {
+				brokerLog.Printf("persist pending finalization for run %s: %v", runID, err)
+			}
 			highlights = append(highlights, "Corv could not save the run log locally; remote copy retained")
 		}
 		return Response{
-			OK:         exitCode == 0,
-			ExitCode:   exitCode,
-			Stdout:     bounded,
-			Highlights: highlights,
-			DurationMS: time.Since(startedAt).Milliseconds(),
-			RunID:      runID,
+			OK:              exitCode == 0,
+			ExitCode:        exitCode,
+			Stdout:          rendered,
+			Highlights:      highlights,
+			DurationMS:      time.Since(startedAt).Milliseconds(),
+			RunID:           runID,
+			Truncated:       retained.truncated,
+			OutputTruncated: rendered != cleaned,
+			OriginalBytes:   retained.originalBytes,
+			SavedBytes:      int64(len(retained.data)),
+			ReturnedBytes:   int64(len(rendered)),
 		}, localPath != ""
 	}
 
-	// A still-running command returns a budget-bounded peek; the full log is
-	// retrievable with corv output once it finishes.
+	cleaned := output.Clean([]byte(delta))
+	rendered := output.Bound(cleaned, output.Options{MaxBytes: maxRunningOutputBytes})
+	highlights := output.Signals(cleaned, 8)
 	return Response{
-		OK:         false,
-		ExitCode:   75,
-		Stdout:     output.Bound(cleaned, output.Options{MaxBytes: maxInlineOutputBytes}),
-		Highlights: highlights,
-		DurationMS: time.Since(startedAt).Milliseconds(),
-		Running:    true,
-		RunID:      runID,
+		OK:              false,
+		ExitCode:        75,
+		Stdout:          rendered,
+		Highlights:      highlights,
+		DurationMS:      time.Since(startedAt).Milliseconds(),
+		Running:         true,
+		RunID:           runID,
+		OutputTruncated: rendered != cleaned,
+		ReturnedBytes:   int64(len(rendered)),
 	}, false
 }
 
@@ -380,7 +400,7 @@ func (s *server) readRemoteState(e *entry, p profile.Profile, reg profile.Regist
 
 func startJobCommand(id string) string {
 	return fmt.Sprintf(
-		"umask 077; if ! command -v id >/dev/null 2>&1 || ! command -v tail >/dev/null 2>&1 || ! command -v head >/dev/null 2>&1; then echo CORV_NO_POSIX; exit 127; fi; if command -v setsid >/dev/null 2>&1; then runner=setsid; elif command -v nohup >/dev/null 2>&1; then runner=nohup; else echo CORV_NO_POSIX; exit 127; fi; dir=${TMPDIR:-/tmp}/corv-jobs-$(id -u); mkdir -p \"$dir\" && chmod 700 \"$dir\" && cat > \"$dir/%s.sh\" && : > \"$dir/%s.log\" && { \"$runner\" sh -c 'sh \"$0\" > \"$1\" 2>&1; echo $? > \"$2\"' \"$dir/%s.sh\" \"$dir/%s.log\" \"$dir/%s.rc\" >/dev/null 2>&1 & echo CORV_STARTED; }",
+		"umask 077; for tool in id tail head wc mkdir chmod cat rm sh; do command -v \"$tool\" >/dev/null 2>&1 || { echo CORV_NO_POSIX; exit 127; }; done; if command -v setsid >/dev/null 2>&1; then runner=setsid; elif command -v nohup >/dev/null 2>&1; then runner=nohup; else echo CORV_NO_POSIX; exit 127; fi; dir=${TMPDIR:-/tmp}/corv-jobs-$(id -u); mkdir -p \"$dir\" && chmod 700 \"$dir\" && cat > \"$dir/%s.sh\" && : > \"$dir/%s.log\" && { \"$runner\" sh -c 'sh \"$0\" > \"$1\" 2>&1; echo $? > \"$2\"' \"$dir/%s.sh\" \"$dir/%s.log\" \"$dir/%s.rc\" >/dev/null 2>&1 & echo CORV_STARTED; }",
 		id, id, id, id, id,
 	)
 }
@@ -404,38 +424,95 @@ func cleanupJobCommand(id string) string {
 	return fmt.Sprintf("dir=${TMPDIR:-/tmp}/corv-jobs-$(id -u); rm -f \"$dir/%s.sh\" \"$dir/%s.log\" \"$dir/%s.rc\"", id, id, id)
 }
 
-func (s *server) copyAndCleanupRemote(e *entry, p profile.Profile, reg profile.Registry, id string, metadata runMetadata) (string, bool) {
-	// Cleanup on reattach; startup sweep removes abandoned jobs after jobTTL.
-	fetchLimit := int64(maxLocalLogBytes + 1)
-	res, err := s.runRaw(e, p, reg, fullLogCommand(id), fetchLimit)
-	truncated := false
+type retainedLog struct {
+	data          []byte
+	originalBytes int64
+	truncated     bool
+}
+
+func (s *server) copyAndCleanupRemote(e *entry, p profile.Profile, reg profile.Registry, id string, metadata runMetadata) (string, retainedLog) {
+	fetchLimit := int64(maxLocalLogBytes + retainedLogFrameMargin)
+	res, err := s.runRawTimeout(e, p, reg, fullLogCommand(id), fetchLimit, fullLogTransferTimeout)
 	if err == nil && res.OK() {
-		data := res.Stdout
-		if len(data) > maxLocalLogBytes {
-			truncated = true
-			data = data[:maxLocalLogBytes]
+		retained, parseErr := parseRetainedLog(res.Stdout)
+		if parseErr != nil {
+			brokerLog.Printf("read retained log for run %s: %v", id, parseErr)
+			return "", retainedLog{}
 		}
-		metadata.Truncated = truncated
-		path := s.saveRunLog(id, data, metadata)
+		metadata.Truncated = retained.truncated
+		metadata.OriginalBytes = retained.originalBytes
+		metadata.SavedBytes = int64(len(retained.data))
+		path := s.saveRunLog(id, retained.data, metadata)
 		if path != "" {
 			_, _ = s.runRaw(e, p, reg, cleanupJobCommand(id), maxDeltaBytes)
 		}
-		return path, truncated
+		return path, retained
 	}
-	return "", false
+	return "", retainedLog{}
 }
 
 func fullLogCommand(id string) string {
-	return fmt.Sprintf("dir=${TMPDIR:-/tmp}/corv-jobs-$(id -u); cat \"$dir/%s.log\" 2>/dev/null | head -c %d || true", id, maxLocalLogBytes+1)
+	return fmt.Sprintf(
+		"dir=${TMPDIR:-/tmp}/corv-jobs-$(id -u); log=\"$dir/%s.log\"; size=$(wc -c < \"$log\" 2>/dev/null) || size=0; size=$((size + 0)); if [ \"$size\" -le %d ]; then printf 'CORV_LOG_V1 %%s %%s 0\\n' \"$size\" \"$size\"; cat \"$log\" 2>/dev/null || true; else printf 'CORV_LOG_V1 %%s %d %d\\n' \"$size\"; head -c %d \"$log\" 2>/dev/null; tail -c %d \"$log\" 2>/dev/null; fi",
+		id, maxLocalLogBytes, retainedLogHeadBytes, retainedLogTailBytes, retainedLogHeadBytes, retainedLogTailBytes,
+	)
+}
+
+func parseRetainedLog(raw []byte) (retainedLog, error) {
+	lineEnd := bytes.IndexByte(raw, '\n')
+	if lineEnd < 0 || lineEnd >= retainedLogFrameMargin {
+		return retainedLog{}, errors.New("invalid remote log frame")
+	}
+	fields := strings.Fields(string(raw[:lineEnd]))
+	if len(fields) != 4 || fields[0] != "CORV_LOG_V1" {
+		return retainedLog{}, errors.New("invalid remote log frame")
+	}
+	originalBytes, err := strconv.ParseInt(fields[1], 10, 64)
+	if err != nil {
+		return retainedLog{}, errors.New("invalid remote log sizes")
+	}
+	headBytes, err := strconv.ParseInt(fields[2], 10, 64)
+	if err != nil {
+		return retainedLog{}, errors.New("invalid remote log sizes")
+	}
+	tailBytes, err := strconv.ParseInt(fields[3], 10, 64)
+	if err != nil {
+		return retainedLog{}, errors.New("invalid remote log sizes")
+	}
+	if originalBytes < 0 || headBytes < 0 || tailBytes < 0 ||
+		headBytes+tailBytes > int64(maxLocalLogBytes) ||
+		originalBytes < headBytes+tailBytes {
+		return retainedLog{}, errors.New("invalid remote log sizes")
+	}
+	payload := raw[lineEnd+1:]
+	if int64(len(payload)) != headBytes+tailBytes {
+		return retainedLog{}, errors.New("incomplete remote log frame")
+	}
+	if originalBytes == int64(len(payload)) {
+		return retainedLog{data: append([]byte(nil), payload...), originalBytes: originalBytes}, nil
+	}
+
+	omitted := originalBytes - headBytes - tailBytes
+	marker := []byte(fmt.Sprintf("\n[Corv retained first %d bytes and last %d bytes; %d bytes omitted]\n", headBytes, tailBytes, omitted))
+	if len(payload)+len(marker) > maxLocalLogBytes {
+		return retainedLog{}, errors.New("retained log exceeds local limit")
+	}
+	data := make([]byte, 0, len(payload)+len(marker))
+	data = append(data, payload[:headBytes]...)
+	data = append(data, marker...)
+	data = append(data, payload[headBytes:]...)
+	return retainedLog{data: data, originalBytes: originalBytes, truncated: true}, nil
 }
 
 type runMetadata struct {
-	ExitCode   int       `json:"exit_code"`
-	OK         bool      `json:"ok"`
-	Connection string    `json:"connection"`
-	StartedAt  time.Time `json:"started_at"`
-	FinishedAt time.Time `json:"finished_at"`
-	Truncated  bool      `json:"truncated"`
+	ExitCode      int       `json:"exit_code"`
+	OK            bool      `json:"ok"`
+	Connection    string    `json:"connection"`
+	StartedAt     time.Time `json:"started_at"`
+	FinishedAt    time.Time `json:"finished_at"`
+	Truncated     bool      `json:"truncated"`
+	OriginalBytes int64     `json:"original_bytes,omitempty"`
+	SavedBytes    int64     `json:"saved_bytes,omitempty"`
 }
 
 func (s *server) saveRunLog(id string, data []byte, metadata runMetadata) string {
@@ -447,30 +524,15 @@ func (s *server) saveRunLog(id string, data []byte, metadata runMetadata) string
 		return ""
 	}
 	path := filepath.Join(p.RunsDir, id+".log")
-	if metadata.Truncated {
-		data = append(data, []byte(fmt.Sprintf("\n[Corv log truncated at %d MiB]\n", maxLocalLogBytes/(1024*1024)))...)
-	}
 	meta, err := json.Marshal(metadata)
 	if err != nil {
 		return ""
 	}
 	metaPath := filepath.Join(p.RunsDir, id+".meta.json")
-	logTmp := path + ".tmp"
-	metaTmp := metaPath + ".tmp"
-	if err := os.WriteFile(logTmp, data, 0o600); err != nil {
+	if err := writeJobFile(metaPath, meta, 0o600); err != nil {
 		return ""
 	}
-	if err := os.WriteFile(metaTmp, meta, 0o600); err != nil {
-		_ = os.Remove(logTmp)
-		return ""
-	}
-	if err := os.Rename(metaTmp, metaPath); err != nil {
-		_ = os.Remove(logTmp)
-		_ = os.Remove(metaTmp)
-		return ""
-	}
-	if err := os.Rename(logTmp, path); err != nil {
-		_ = os.Remove(logTmp)
+	if err := writeJobFile(path, data, 0o600); err != nil {
 		_ = os.Remove(metaPath)
 		return ""
 	}
@@ -524,11 +586,16 @@ func (s *server) output(req Request) Response {
 	if req.Pattern != "" {
 		text = grepText(text, req.Pattern)
 	}
+	rendered := output.Bound(text, output.Options{MaxBytes: maxInlineOutputBytes})
 	resp := Response{
-		OK:         true,
-		Stdout:     output.Bound(text, output.Options{Unbounded: true}),
-		Highlights: output.Signals(text, 8),
-		RunID:      req.RunID,
+		OK:              true,
+		Stdout:          rendered,
+		Highlights:      output.Signals(text, 8),
+		RunID:           req.RunID,
+		OutputTruncated: rendered != text,
+		OriginalBytes:   int64(len(data)),
+		SavedBytes:      int64(len(data)),
+		ReturnedBytes:   int64(len(rendered)),
 	}
 	metaData, err := readRunFile(filepath.Join(p.RunsDir, req.RunID+".meta.json"))
 	if errors.Is(err, os.ErrNotExist) {
@@ -551,10 +618,21 @@ func (s *server) output(req Request) Response {
 	resp.StartedAt = &metadata.StartedAt
 	resp.FinishedAt = &metadata.FinishedAt
 	resp.Truncated = metadata.Truncated
+	if metadata.OriginalBytes > 0 {
+		resp.OriginalBytes = metadata.OriginalBytes
+	}
+	if metadata.SavedBytes > 0 {
+		resp.SavedBytes = metadata.SavedBytes
+	}
 	if metadata.Truncated {
-		resp.Highlights = append(resp.Highlights, fmt.Sprintf("saved log was truncated at %d MiB; output is incomplete", maxLocalLogBytes/(1024*1024)))
+		resp.Highlights = append(resp.Highlights, fmt.Sprintf("retained log exceeded %d MiB; middle bytes were omitted", maxLocalLogBytes/(1024*1024)))
 	}
 	resp.RunMetadata = true
+	if s.audit != nil {
+		if err := s.audit.Complete(req.RunID, metadata.StartedAt, metadata.FinishedAt, metadata.ExitCode); err != nil {
+			brokerLog.Printf("record completion for run %s: %v", req.RunID, err)
+		}
+	}
 	return resp
 }
 
@@ -563,33 +641,31 @@ func (s *server) finalizeOutput(runID string) (Response, bool) {
 	if !ok {
 		return Response{}, false
 	}
-	reg, err := s.store.Load()
+	snapshot, ok, err := s.loadConnectionSnapshot(rec.Profile)
 	if err != nil {
 		return Response{OK: false, Error: err.Error(), RunID: runID}, true
 	}
-	p, ok := reg.Get(rec.Profile)
 	if !ok {
 		return Response{OK: false, Error: "saved connection for this run no longer exists", RunID: runID}, true
 	}
-	fingerprint, err := s.profileFingerprint(p, reg)
-	if err != nil {
-		return Response{OK: false, Error: err.Error(), RunID: runID}, true
-	}
+	p := snapshot.profile
+	reg := snapshot.registry
+	fingerprint := snapshot.fingerprint
 	if rec.Fingerprint != "" && rec.Fingerprint != fingerprint {
 		return Response{OK: false, Error: "saved connection changed; cannot finalize the previous remote run safely", RunID: runID}, true
 	}
 
 	e := s.entryFor(p.Name)
-	s.prepareEntry(e, p.Name, fingerprint)
+	s.prepareEntry(e, snapshot)
 	// Register the rebuilt job so concurrent finalizers and a watching exec
 	// share one *job (and one pollMu); otherwise two callers could each fetch
 	// and clean up the same remote run and race to overwrite the saved log.
 	e.mu.Lock()
-	j := e.jobs[rec.Command]
+	j := e.jobs[rec.Key]
 	if j == nil || j.id != runID {
 		j = recordToJob(rec)
 		j.fingerprint = fingerprint
-		e.jobs[rec.Command] = j
+		e.jobs[rec.Key] = j
 	}
 	e.mu.Unlock()
 
@@ -657,7 +733,7 @@ func (s *server) finalizeOutput(runID string) (Response, bool) {
 			RunID: runID,
 		}, true
 	}
-	s.removeJob(e, p.Name, rec.Command, j)
+	s.removeJob(e, p.Name, rec.Key, j)
 	return Response{}, false
 }
 
@@ -715,7 +791,7 @@ func parseWait(raw string, fallback time.Duration) time.Duration {
 
 func sweepRemoteCommand() string {
 	cutoff := fmt.Sprintf("%016x", time.Now().Add(-jobTTL).Unix())
-	return fmt.Sprintf("dir=${TMPDIR:-/tmp}/corv-jobs-$(id -u); command -v find >/dev/null 2>&1 || exit 0; for f in \"$dir\"/*.sh \"$dir\"/*.log \"$dir\"/*.rc; do [ -e \"$f\" ] || continue; base=${f##*/}; stem=${base%%.*}; log=\"$dir/$stem.log\"; recent=$(find \"$log\" -mtime -1 -print 2>/dev/null); [ -n \"$recent\" ] && continue; ts=${base%%-*}; [ \"$ts\" \\< \"%s\" ] && rm -f \"$f\"; done", cutoff)
+	return fmt.Sprintf("dir=${TMPDIR:-/tmp}/corv-jobs-$(id -u); for rc in \"$dir\"/*.rc; do [ -s \"$rc\" ] || continue; base=${rc##*/}; stem=${base%%.*}; ts=${stem%%-*}; [ \"$ts\" \\< \"%s\" ] && rm -f \"$dir/$stem.sh\" \"$dir/$stem.log\" \"$dir/$stem.rc\"; done", cutoff)
 }
 
 func validRunID(id string) bool {

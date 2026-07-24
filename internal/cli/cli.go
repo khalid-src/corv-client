@@ -27,11 +27,15 @@ Usage:
   corv add <name> <user@host> [--port N] [--key PATH] [--jump user@bastion]
   corv import [path]       import hosts from an SSH config
   corv list                list saved connection names (--full for details)
+  corv test <name>         diagnose a saved connection (--json; --full for details)
+  corv status              show warm connections (--json; --full for details)
   corv rm <name>           remove a saved connection
   corv disconnect <name>   drop the held-open connection
-  corv output <run-id>     show a completed async run log (--json for tools)
+  corv output <run-id> [pattern]
+                           show bounded async run output (--json for tools)
   corv log [name]          show recent command history (--clear to wipe it)
   corv doctor [name]       check the local setup (--full for details)
+  corv vault reset         clear stored credentials (--all removes connections too)
   corv update              download and install the latest release
   corv uninstall           remove corv (--purge also deletes saved data)
 
@@ -41,9 +45,8 @@ appear in the command line, prompts, or logs shown to an agent.
 
 Commands after --: a single argument is run as a remote shell command line
 (corv srv -- "cd /app && make"); multiple arguments are passed as a preserved
-argument vector (corv srv -- sh -lc "cd /app && make"). Either way the remote
-runs exactly what you intended. Use --stdin-base64 for complex shell text that
-must bypass local quoting and PowerShell pipe encoding.`
+argument vector (corv srv -- sh -lc "cd /app && make"). Use --stdin-base64 for
+complex shell text that must bypass local quoting and PowerShell pipe encoding.`
 
 // deps bundles the local state every command needs.
 type deps struct {
@@ -67,6 +70,8 @@ func loadDeps() (deps, error) {
 	}, nil
 }
 
+var loadDependencies = loadDeps
+
 // Run is the program entry point. It returns a process exit code.
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	cleanupOldExecutable()
@@ -88,11 +93,28 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return cmdUpdate(args[1:], stdout, stderr)
 		case "uninstall":
 			return cmdUninstall(args[1:], stdout, stderr)
+		case "output":
+			return cmdOutput(args[1:], stdout, stderr)
+		case "status":
+			return cmdStatus(args[1:], stdout, stderr)
 		}
 	}
 
-	d, err := loadDeps()
+	d, err := loadDependencies()
 	if err != nil {
+		if len(args) > 0 && args[0] == "test" {
+			name, asJSON, full, _ := parseTestArgs(args[1:])
+			if asJSON {
+				result := failedConnectionTest(name, "local", "local_error", err.Error())
+				if !full {
+					result = privateConnectionTestResult(result)
+				}
+				return writeConnectionTestJSON(stdout, result)
+			}
+		}
+		if len(args) > 0 && !reservedCommand(args[0]) && wantsJSON(args[1:]) {
+			return writeExecErrorJSON(stdout, args[0], "local_error", err.Error())
+		}
 		return fail(stderr, err)
 	}
 
@@ -111,12 +133,14 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return cmdRemove(d, args[1:], stdout, stderr)
 	case "disconnect", "close":
 		return cmdDisconnect(d, args[1:], stdout, stderr)
-	case "output":
-		return cmdOutput(args[1:], stdout, stderr)
 	case "log":
 		return cmdLog(d, args[1:], stdout, stderr)
 	case "doctor":
 		return cmdDoctor(d, args[1:], stdout, stderr)
+	case "test":
+		return cmdTest(d, args[1:], stdout, stderr)
+	case "vault":
+		return cmdVault(d, args[1:], stdin, stdout, stderr)
 	default:
 		return cmdConnect(d, args, stdin, stdout, stderr)
 	}

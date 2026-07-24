@@ -43,7 +43,7 @@ func Bound(text string, opt Options) string {
 		b.WriteString(l)
 		b.WriteByte('\n')
 	}
-	fmt.Fprintf(&b, "... %d line(s) hidden (full output: see run log) ...\n", hidden)
+	fmt.Fprintf(&b, "... %d line(s) hidden ...\n", hidden)
 	for _, l := range lines[len(lines)-o.TailLines:] {
 		b.WriteString(l)
 		b.WriteByte('\n')
@@ -87,7 +87,7 @@ func boundBytes(full, trimmed string, max int) string {
 			b.WriteString(l)
 			b.WriteByte('\n')
 		}
-		fmt.Fprintf(&b, "... %d line(s) hidden (full output: see run log) ...\n", hidden)
+		fmt.Fprintf(&b, "... %d line(s) hidden ...\n", hidden)
 		for _, l := range lines[tailStart:] {
 			b.WriteString(l)
 			b.WriteByte('\n')
@@ -97,7 +97,7 @@ func boundBytes(full, trimmed string, max int) string {
 
 	// Too few line breaks to trim on boundaries (e.g. one long minified line):
 	// cut on rune boundaries so the budget is still respected.
-	return cutHead(trimmed, half) + "\n... output trimmed (full output: see run log) ...\n" + cutTail(trimmed, half)
+	return cutHead(trimmed, half) + "\n... output trimmed ...\n" + cutTail(trimmed, half)
 }
 
 // cutHead returns s truncated to at most n bytes, ending on a rune boundary.

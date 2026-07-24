@@ -3,8 +3,8 @@ package sshconn
 import "github.com/khalid-src/corv-client/internal/profile"
 
 // SecretFunc returns the stored password and key passphrase for a vault
-// reference, or empty strings when none is available.
-type SecretFunc func(secretRef string) (password, passphrase string)
+// reference.
+type SecretFunc func(secretRef string) (password, passphrase string, err error)
 
 // EnrichJumpChain fills in missing per-hop credentials from saved profiles.
 // When a hop matches a saved profile - by name, or by host[:port] - it adopts
@@ -14,7 +14,7 @@ type SecretFunc func(secretRef string) (password, passphrase string)
 //
 // This is the single source of truth for jump-host auth resolution, shared by
 // the interactive and broker dial paths.
-func EnrichJumpChain(jumps []JumpHost, reg profile.Registry, secretFor SecretFunc) {
+func EnrichJumpChain(jumps []JumpHost, reg profile.Registry, secretFor SecretFunc) error {
 	for i := range jumps {
 		p, ok := findJumpProfile(jumps[i], reg)
 		if !ok {
@@ -36,7 +36,10 @@ func EnrichJumpChain(jumps []JumpHost, reg profile.Registry, secretFor SecretFun
 		if p.SecretRef == "" || secretFor == nil {
 			continue
 		}
-		password, passphrase := secretFor(p.SecretRef)
+		password, passphrase, err := secretFor(p.SecretRef)
+		if err != nil {
+			return err
+		}
 		if jumps[i].Password == "" {
 			jumps[i].Password = password
 		}
@@ -44,6 +47,7 @@ func EnrichJumpChain(jumps []JumpHost, reg profile.Registry, secretFor SecretFun
 			jumps[i].Passphrase = passphrase
 		}
 	}
+	return nil
 }
 
 // findJumpProfile resolves a jump hop to a saved profile, first by profile

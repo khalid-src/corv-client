@@ -5,11 +5,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 
+	"github.com/khalid-src/corv-client/internal/atomicfile"
 	"github.com/khalid-src/corv-client/internal/paths"
 )
+
+var tokenReader io.Reader = rand.Reader
 
 // endpoint records how to reach a running broker. Stored in a 0600 file under
 // the Corv root; the token gates access so another local user cannot drive
@@ -63,7 +67,7 @@ func writeEndpoint(ep endpoint) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	return atomicfile.Write(path, data, 0o600)
 }
 
 func removeEndpoint() {
@@ -72,8 +76,19 @@ func removeEndpoint() {
 	}
 }
 
-func newToken() string {
+func removeEndpointIfOwned(owner endpoint) bool {
+	current, err := readEndpoint()
+	if err != nil || current.Addr != owner.Addr || current.Token != owner.Token || current.PID != owner.PID {
+		return false
+	}
+	removeEndpoint()
+	return true
+}
+
+func newToken() (string, error) {
 	b := make([]byte, 32)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+	if _, err := io.ReadFull(tokenReader, b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }

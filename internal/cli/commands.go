@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	"golang.org/x/term"
@@ -17,6 +16,7 @@ import (
 	"github.com/khalid-src/corv-client/internal/broker"
 	"github.com/khalid-src/corv-client/internal/profile"
 	"github.com/khalid-src/corv-client/internal/sshconn"
+	"github.com/khalid-src/corv-client/internal/statelock"
 	"github.com/khalid-src/corv-client/internal/vault"
 )
 
@@ -61,38 +61,82 @@ func cmdAdd(d deps, args []string, stdin io.Reader, stdout, stderr io.Writer) in
 	}
 
 	ref := "profile:" + p.Name
-	reg, err := d.store.Load()
-	if err != nil {
-		return fail(stderr, err)
-	}
-	if err := reg.Set(p); err != nil {
+	validation := profile.Registry{}
+	if err := validation.Set(p); err != nil {
 		return fail(stderr, err)
 	}
 
+	var secret vault.Secret
+	hasSecret := false
 	if p.IdentityFile != "" {
 		if passphrase := readSecret(stdin, stdout, "Key passphrase (leave empty for unencrypted key or agent auth): "); passphrase != "" {
-			if err := d.secrets.Set(ref, vault.Secret{Passphrase: passphrase}); err != nil {
-				return fail(stderr, err)
-			}
-			p.SecretRef = ref
+			secret.Passphrase = passphrase
+			hasSecret = true
 		}
 	} else {
 		// Password is read without echo and kept only in the encrypted vault.
 		if password := readSecret(stdin, stdout, "Password (leave empty for key or agent auth): "); password != "" {
-			if err := d.secrets.Set(ref, vault.Secret{Password: password}); err != nil {
-				return fail(stderr, err)
-			}
-			p.SecretRef = ref
+			secret.Password = password
+			hasSecret = true
 		}
 	}
 
-	if err := reg.Set(p); err != nil {
+	replaced := false
+	err := statelock.WithLock(func() error {
+		reg, err := d.store.Load()
+		if err != nil {
+			return err
+		}
+		existing, exists := reg.Get(p.Name)
+		replaced = exists
+		if exists && !hasSecret {
+			p.SecretRef = existing.SecretRef
+		}
+
+		var restoreSecret func() error
+		if hasSecret {
+			previous, previousExists, err := d.secrets.Get(ref)
+			if err != nil {
+				return fmt.Errorf("read stored credentials for %q: %w", p.Name, err)
+			}
+			if err := d.secrets.Set(ref, secret); err != nil {
+				return err
+			}
+			p.SecretRef = ref
+			restoreSecret = func() error {
+				if previousExists {
+					return d.secrets.Set(ref, previous)
+				}
+				return d.secrets.Delete(ref)
+			}
+		}
+		if err := reg.Set(p); err != nil {
+			if restoreSecret != nil {
+				return errors.Join(err, restoreSecret())
+			}
+			return err
+		}
+		if err := d.store.Save(reg); err != nil {
+			if restoreSecret != nil {
+				return errors.Join(err, restoreSecret())
+			}
+			return err
+		}
+		if exists && existing.SecretRef != "" && existing.SecretRef != p.SecretRef {
+			if err := d.secrets.Delete(existing.SecretRef); err != nil {
+				return fmt.Errorf("remove replaced credentials for %q: %w", p.Name, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		return fail(stderr, err)
 	}
-	if err := d.store.Save(reg); err != nil {
-		return fail(stderr, err)
+	verb := "added"
+	if replaced {
+		verb = "replaced"
 	}
-	fmt.Fprintf(stdout, "added %s -> %s\n", p.Name, p.Target)
+	fmt.Fprintf(stdout, "%s %s -> %s\n", verb, p.Name, p.Target)
 	return 0
 }
 
@@ -103,11 +147,11 @@ func readSecret(stdin io.Reader, stdout io.Writer, prompt string) string {
 		fmt.Fprint(stdout, prompt)
 		b, _ := term.ReadPassword(int(f.Fd()))
 		fmt.Fprintln(stdout)
-		return strings.TrimSpace(string(b))
+		return string(b)
 	}
 	sc := bufio.NewScanner(stdin)
 	if sc.Scan() {
-		return strings.TrimSpace(sc.Text())
+		return sc.Text()
 	}
 	return ""
 }
@@ -117,8 +161,8 @@ func readSecret(stdin io.Reader, stdout io.Writer, prompt string) string {
 func reservedCommand(name string) bool {
 	switch name {
 	case "add", "import", "list", "ls", "rm", "remove", "disconnect", "close",
-		"output", "log", "doctor", "help", "version", "__broker",
-		"update", "upgrade", "uninstall":
+		"output", "log", "doctor", "test", "status", "vault", "help", "version",
+		"__broker", "update", "upgrade", "uninstall":
 		return true
 	}
 	return false
@@ -138,15 +182,19 @@ func cmdImport(d deps, args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(stderr, err)
 	}
-	reg, err := d.store.Load()
+	added := 0
+	err = statelock.WithLock(func() error {
+		reg, err := d.store.Load()
+		if err != nil {
+			return err
+		}
+		added, err = importInto(d, &reg, imported, stderr)
+		if err != nil {
+			return err
+		}
+		return d.store.Save(reg)
+	})
 	if err != nil {
-		return fail(stderr, err)
-	}
-	added, err := importInto(d, &reg, imported, stderr)
-	if err != nil {
-		return fail(stderr, err)
-	}
-	if err := d.store.Save(reg); err != nil {
 		return fail(stderr, err)
 	}
 	fmt.Fprintf(stdout, "imported %d connection(s)\n", added)
@@ -212,8 +260,8 @@ func cmdList(d deps, args []string, stdout, stderr io.Writer) int {
 	}
 
 	// Default: names only. Addresses, users and ports stay local and are never
-	// printed to whoever (or whatever) ran the command - an AI agent only needs
-	// the name to connect. `--full` shows the details for a human at the keyboard.
+	// printed to the caller - an agent only needs the name to connect.
+	// `--full` shows the details for a human at the keyboard.
 	if !full {
 		for _, p := range profiles {
 			fmt.Fprintln(stdout, p.Name)
@@ -245,20 +293,28 @@ func cmdRemove(d deps, args []string, stdout, stderr io.Writer) int {
 	if len(args) != 1 {
 		return fail(stderr, errors.New("usage: corv rm <name>"))
 	}
-	reg, err := d.store.Load()
+	err := statelock.WithLock(func() error {
+		reg, err := d.store.Load()
+		if err != nil {
+			return err
+		}
+		p, ok := reg.Get(args[0])
+		if !ok {
+			return fmt.Errorf("unknown connection %q", args[0])
+		}
+		reg.Remove(args[0])
+		if err := d.store.Save(reg); err != nil {
+			return err
+		}
+		if p.SecretRef != "" {
+			if err := d.secrets.Delete(p.SecretRef); err != nil {
+				return fmt.Errorf("remove stored credentials for %q: %w", args[0], err)
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return fail(stderr, err)
-	}
-	p, ok := reg.Get(args[0])
-	if !ok {
-		return fail(stderr, fmt.Errorf("unknown connection %q", args[0]))
-	}
-	reg.Remove(args[0])
-	if err := d.store.Save(reg); err != nil {
-		return fail(stderr, err)
-	}
-	if p.SecretRef != "" {
-		_ = d.secrets.Delete(p.SecretRef)
 	}
 	fmt.Fprintf(stdout, "removed %s\n", args[0])
 	return 0
@@ -362,17 +418,26 @@ func cmdOutput(args []string, stdout, stderr io.Writer) int {
 	if asJSON {
 		return writeOutputJSON(stdout, resp)
 	}
-	if !resp.OK && !resp.RunMetadata {
-		return fail(stderr, errors.New(resp.Error))
-	}
+	return writeOutputPlain(stdout, stderr, resp)
+}
+
+func writeOutputPlain(stdout, stderr io.Writer, resp broker.Response) int {
 	io.WriteString(stdout, resp.Stdout)
 	for _, h := range resp.Highlights {
 		fmt.Fprintf(stderr, "corv warning: %s\n", h)
 	}
-	if resp.RunMetadata && resp.ExitCode != 0 {
-		return resp.ExitCode
+	if resp.Running {
+		message := resp.Error
+		if message == "" {
+			message = fmt.Sprintf("run %s is still in progress", resp.RunID)
+		}
+		fmt.Fprintln(stderr, message)
+		return 75
 	}
-	return 0
+	if !resp.OK && !resp.RunMetadata {
+		return fail(stderr, errors.New(resp.Error))
+	}
+	return outputExitCode(resp)
 }
 
 func parseOutputArgs(args []string) (bool, string, string, error) {
@@ -405,6 +470,8 @@ func writeOutputJSON(stdout io.Writer, resp broker.Response) int {
 		"stdout":     resp.Stdout,
 		"highlights": highlights,
 		"ok":         resp.OK,
+		"running":    resp.Running,
+		"exit_code":  outputExitCode(resp),
 	}
 	if resp.Error != "" {
 		payload["error"] = resp.Error
@@ -414,15 +481,42 @@ func writeOutputJSON(stdout io.Writer, resp broker.Response) int {
 	}
 	if resp.RunMetadata {
 		payload["connection"] = resp.Connection
-		payload["exit_code"] = resp.ExitCode
-		payload["running"] = false
 		payload["started_at"] = resp.StartedAt
 		payload["finished_at"] = resp.FinishedAt
 		payload["truncated"] = resp.Truncated
 	}
+	addOutputMetadata(payload, resp)
 	enc := json.NewEncoder(stdout)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(payload)
+	return outputExitCode(resp)
+}
+
+func addOutputMetadata(payload map[string]any, resp broker.Response) {
+	if resp.RunMetadata || resp.ReturnedBytes > 0 || resp.Stdout != "" {
+		payload["returned_bytes"] = resp.ReturnedBytes
+	}
+	if resp.RunMetadata || resp.OriginalBytes > 0 {
+		payload["original_bytes"] = resp.OriginalBytes
+	}
+	if resp.RunMetadata || resp.SavedBytes > 0 {
+		payload["saved_bytes"] = resp.SavedBytes
+	}
+	if resp.RunMetadata || resp.OutputTruncated {
+		payload["output_truncated"] = resp.OutputTruncated
+	}
+	if resp.Truncated {
+		payload["truncated"] = true
+	}
+}
+
+func outputExitCode(resp broker.Response) int {
+	if resp.Running {
+		return 75
+	}
+	if resp.RunMetadata {
+		return resp.ExitCode
+	}
 	if resp.OK {
 		return 0
 	}
@@ -447,18 +541,23 @@ func cmdDoctor(d deps, args []string, stdout, stderr io.Writer) int {
 	self, _ := os.Executable()
 	client := broker.NewClient(self)
 
-	// Running() only pings; List() goes through ensureRunning() and could spawn
-	// the broker. Gate List() behind Running() so a status check never starts it.
 	var held []broker.HeldInfo
-	if client.Running() {
-		held, _ = client.List()
+	running, connections, _ := client.Status()
+	if running {
+		for _, connection := range connections {
+			held = append(held, broker.HeldInfo{
+				Name:   connection.Name,
+				Target: connection.Target,
+				IdleMS: connection.IdleMS,
+			})
+		}
 		fmt.Fprintf(stdout, "broker:           running (%d held connection(s))\n", len(held))
 	} else {
 		fmt.Fprintln(stdout, "broker:           not running (starts on first command)")
 	}
 	fmt.Fprintf(stdout, "config:           %s\n", presentLabel(d.paths.ConfigFile))
 	fmt.Fprintf(stdout, "audit log:        %s\n", presentLabel(d.paths.AuditFile))
-	fmt.Fprintln(stdout, "remote footprint: none")
+	fmt.Fprintln(stdout, "remote footprint: temporary files for detached runs only")
 
 	for _, h := range held {
 		if full {

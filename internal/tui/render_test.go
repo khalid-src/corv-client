@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/khalid-src/corv-client/internal/profile"
@@ -45,7 +46,7 @@ func TestViewNeverExceedsTerminalWidth(t *testing.T) {
 // TestFooterKeepsAllControlsWhenNarrow ensures the footer wraps rather than
 // dropping controls: every key hint stays visible even on a narrow terminal.
 func TestFooterKeepsAllControlsWhenNarrow(t *testing.T) {
-	wants := []string{"Navigate", "Connect", "Add", "Edit", "Delete", "Import", "Logs", "Info", "Quit"}
+	wants := []string{"Navigate", "Connect", "Add", "Edit", "Delete", "Import", "Logs", "Test", "Info", "Quit"}
 	for _, w := range []int{24, 30, 40, 60, 100} {
 		m := model{screen: screenList}
 		m.table = newConnectionTable()
@@ -61,6 +62,41 @@ func TestFooterKeepsAllControlsWhenNarrow(t *testing.T) {
 			if got := lipgloss.Width(line); got > w {
 				t.Errorf("width %d: footer line %d width %d > %d", w, n, got, w)
 			}
+		}
+	}
+}
+
+func TestConnectionTestActionReportsResult(t *testing.T) {
+	m := model{
+		screen:   screenList,
+		profiles: []profile.Profile{{Name: "srv", Target: "ubuntu@example.com"}},
+		testConnection: func(name string) (string, error) {
+			return name + ": connection test passed", nil
+		},
+	}
+	m.table = newConnectionTable()
+	m.width, m.height = 80, 24
+	m.layout()
+
+	updated, cmd := m.updateList(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	if cmd == nil {
+		t.Fatal("test action did not return a command")
+	}
+	updated, _ = updated.(model).Update(cmd())
+	got := updated.(model)
+	if got.message != "srv: connection test passed" || got.err != "" {
+		t.Fatalf("message=%q err=%q", got.message, got.err)
+	}
+}
+
+func TestStatusLineUsesTextWithoutResultGlyphs(t *testing.T) {
+	for _, m := range []model{
+		{message: "connection test passed"},
+		{err: "connection test failed"},
+	} {
+		got := m.statusLine()
+		if strings.ContainsAny(got, "✓✗") {
+			t.Fatalf("status line contains a result glyph: %q", got)
 		}
 	}
 }

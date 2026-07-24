@@ -230,12 +230,14 @@ func TestEnrichJumpChainByEndpointInheritsUser(t *testing.T) {
 		t.Fatal(err)
 	}
 	jumps := []JumpHost{{Host: "bastion.example.com"}}
-	EnrichJumpChain(jumps, reg, func(ref string) (string, string) {
+	if err := EnrichJumpChain(jumps, reg, func(ref string) (string, string, error) {
 		if ref != "profile:bastion" {
 			t.Fatalf("secret ref = %q", ref)
 		}
-		return "", "key-passphrase"
-	})
+		return "", "key-passphrase", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	want := JumpHost{
 		User:         "deploy",
