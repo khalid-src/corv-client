@@ -37,6 +37,8 @@ jobs:
         run: go test -race -count=1 ./...
       - name: Vulnerability scan
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - name: Release notes
+        run: test -f "docs/releases/${GITHUB_REF_NAME}.md"
 
   release:
     needs: verify
@@ -67,4 +69,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
-          body_path: RELEASE_NOTES.md
+          body_path: docs/releases/${{ github.ref_name }}.md

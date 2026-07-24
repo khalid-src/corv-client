@@ -6,6 +6,9 @@
 
 **The SSH client for AI agents and humans.** Connect by name. Reuse authenticated SSH connections. Keep secrets local.
 
+[Latest release: Corv v1.1](docs/releases/v1.1.md) |
+[Complete changelog](CHANGELOG.md)
+
 AI agents don't use SSH the way humans do. Raw SSH requires the calling workflow
 to manage connection details, authentication configuration, prompts, and
 terminal output. Independent invocations also repeat connection setup unless
