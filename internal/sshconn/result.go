@@ -3,7 +3,7 @@
 // connection to a machine and runs commands or interactive shells over it.
 //
 // Using a library rather than shelling out to the OpenSSH binary is what
-// lets Corv hold one connection open per machine and reuse it across
+// lets Corv hold one connection open per saved profile and reuse it across
 // commands identically on every OS - including Windows, whose OpenSSH
 // client cannot multiplex. The remote server still gets nothing but normal
 // SSH; Corv installs nothing there.
@@ -77,8 +77,7 @@ func classifyErr(err error) ErrorKind {
 	case strings.Contains(s, "unable to authenticate") ||
 		strings.Contains(s, "no supported methods") ||
 		strings.Contains(s, "no authentication methods") ||
-		strings.Contains(s, "permission denied") ||
-		strings.Contains(s, "handshake failed"):
+		strings.Contains(s, "permission denied"):
 		return ErrAuth
 	case strings.Contains(s, "no such host") ||
 		strings.Contains(s, "could not resolve"):
@@ -95,6 +94,8 @@ func classifyErr(err error) ErrorKind {
 		strings.Contains(s, "timed out") ||
 		strings.Contains(s, "did not properly respond"): // Windows phrasing
 		return ErrTimeout
+	case strings.Contains(s, "handshake failed"):
+		return ErrSSH
 	case strings.Contains(s, "eof") ||
 		strings.Contains(s, "disconnected") ||
 		strings.Contains(s, "connection reset") ||

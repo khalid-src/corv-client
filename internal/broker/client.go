@@ -19,6 +19,8 @@ var spawnBroker = func(c *Client) error {
 	return c.spawn()
 }
 
+var brokerProcessExited = processExited
+
 // Client talks to the resident broker, starting it on first use.
 type Client struct {
 	self string // path to this executable, used to spawn the broker
@@ -78,13 +80,48 @@ func (c *Client) List() ([]HeldInfo, error) {
 	return resp.Held, nil
 }
 
+// Status returns a snapshot of warm connections without starting the broker.
+func (c *Client) Status() (bool, []StatusInfo, error) {
+	ep, err := readEndpoint()
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil, nil
+	}
+	if err != nil {
+		return false, nil, err
+	}
+	if !brokerIsCurrent(ep, c.self) {
+		return false, nil, nil
+	}
+	resp, err := roundTrip(ep, Request{Op: OpStatus})
+	if err != nil {
+		return false, nil, nil
+	}
+	if !resp.OK {
+		if strings.EqualFold(strings.TrimSpace(resp.Error), "unknown op") {
+			return false, nil, nil
+		}
+		return true, nil, errors.New(resp.Error)
+	}
+	return true, resp.Connections, nil
+}
+
 // Shutdown stops the broker if it is running.
 func (c *Client) Shutdown() error {
-	if _, err := readEndpoint(); err != nil {
+	ep, err := readEndpoint()
+	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	_, err := c.request(Request{Op: OpShutdown})
-	return err
+	if err != nil {
+		return err
+	}
+	resp, err := roundTrip(ep, Request{Op: OpShutdown})
+	if err != nil {
+		return err
+	}
+	if !resp.OK {
+		return errors.New(resp.Error)
+	}
+	return nil
 }
 
 func (c *Client) request(req Request) (Response, error) {
@@ -112,7 +149,9 @@ func (c *Client) ensureRunning() (endpoint, error) {
 		return ep, nil
 	}
 
-	c.stopStaleBroker()
+	if err := c.stopStaleBroker(); err != nil {
+		return endpoint{}, err
+	}
 	removeEndpoint()
 	if err := spawnBroker(c); err != nil {
 		return endpoint{}, err
@@ -162,22 +201,34 @@ func (c *Client) currentEndpoint() (endpoint, bool) {
 	return ep, true
 }
 
-func (c *Client) stopStaleBroker() {
+func (c *Client) stopStaleBroker() error {
 	ep, err := readEndpoint()
 	if err != nil {
-		return
+		return nil
 	}
-	if _, err := roundTrip(ep, Request{Op: OpPing}); err != nil {
-		return
+	alive := false
+	if _, err := roundTrip(ep, Request{Op: OpPing}); err == nil {
+		alive = true
+		_, _ = roundTrip(ep, Request{Op: OpShutdown})
 	}
-	_, _ = roundTrip(ep, Request{Op: OpShutdown})
+	if ep.PID <= 0 {
+		if alive {
+			return errors.New("stale broker did not report a process id")
+		}
+		return nil
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err := roundTrip(ep, Request{Op: OpPing}); err != nil {
-			return
+		exited, err := brokerProcessExited(ep.PID)
+		if err != nil {
+			return fmt.Errorf("check stale broker process %d: %w", ep.PID, err)
+		}
+		if exited {
+			return nil
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	return fmt.Errorf("stale broker process %d did not exit", ep.PID)
 }
 
 func (c *Client) spawn() error {

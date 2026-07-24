@@ -20,6 +20,16 @@ import (
 
 const repoSlug = "khalid-src/corv-client"
 
+const (
+	maxReleaseBinaryBytes = 100 << 20
+	maxChecksumBytes      = 1 << 20
+)
+
+var (
+	removeExecutablePath = removeExecutable
+	removeAllData        = os.RemoveAll
+)
+
 // cmdUpdate downloads the latest released binary for this platform, verifies its
 // SHA-256 checksum, and replaces the running executable in place. It runs only
 // when the user types `corv update`; Corv never updates itself in the background.
@@ -41,11 +51,11 @@ func cmdUpdate(args []string, stdout, stderr io.Writer) int {
 	base := "https://github.com/" + repoSlug + "/releases/latest/download"
 	fmt.Fprintf(stdout, "Updating corv %s -> %s ...\n", version.Version, latest)
 
-	bin, err := httpGet(base + "/" + asset)
+	bin, err := httpGet(base+"/"+asset, maxReleaseBinaryBytes)
 	if err != nil {
 		return fail(stderr, fmt.Errorf("download %s: %w", asset, err))
 	}
-	sums, err := httpGet(base + "/SHA256SUMS")
+	sums, err := httpGet(base+"/SHA256SUMS", maxChecksumBytes)
 	if err != nil {
 		return fail(stderr, fmt.Errorf("download checksums: %w", err))
 	}
@@ -76,20 +86,25 @@ func cmdUninstall(args []string, stdout, stderr io.Writer) int {
 	_ = broker.NewClient(self).Shutdown()
 
 	p, perr := paths.Default()
+	var purgeErr error
 	if purge && perr == nil {
-		if err := os.RemoveAll(p.Root); err != nil {
-			fmt.Fprintf(stderr, "corv: could not remove data dir %s: %v\n", p.Root, err)
+		if purgeErr = removeAllData(p.Root); purgeErr != nil {
+			fmt.Fprintf(stderr, "corv: could not remove data dir %s: %v\n", p.Root, purgeErr)
 		} else {
 			fmt.Fprintf(stdout, "Removed Corv data (%s)\n", p.Root)
 		}
+	} else if purge && perr != nil {
+		purgeErr = perr
+		fmt.Fprintf(stderr, "corv: could not resolve the data directory: %v\n", perr)
 	}
 
 	exe := self
 	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
 		exe = resolved
 	}
-	if err := removeExecutable(exe); err != nil {
-		fmt.Fprintf(stderr, "corv: remove the binary manually: %s (%v)\n", exe, err)
+	removeErr := removeExecutablePath(exe)
+	if removeErr != nil {
+		fmt.Fprintf(stderr, "corv: remove the binary manually: %s (%v)\n", exe, removeErr)
 	} else if runtime.GOOS == "windows" {
 		fmt.Fprintf(stdout, "Removed corv from PATH (a leftover %s.old can be deleted).\n", filepath.Base(exe))
 	} else {
@@ -98,6 +113,9 @@ func cmdUninstall(args []string, stdout, stderr io.Writer) int {
 
 	if !purge && perr == nil {
 		fmt.Fprintf(stdout, "Saved connections and logs are kept in %s (use `corv uninstall --purge` to remove them).\n", p.Root)
+	}
+	if removeErr != nil || purgeErr != nil {
+		return 1
 	}
 	fmt.Fprintln(stdout, "Corv uninstalled.")
 	return 0
@@ -141,7 +159,7 @@ func parseTagFromLocation(loc string) (string, error) {
 	return tag, nil
 }
 
-func httpGet(url string) ([]byte, error) {
+func httpGet(url string, maxBytes int64) ([]byte, error) {
 	client := &http.Client{Timeout: 5 * time.Minute}
 	resp, err := client.Get(url)
 	if err != nil {
@@ -151,7 +169,14 @@ func httpGet(url string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("%s: HTTP %d", url, resp.StatusCode)
 	}
-	return io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("%s: response exceeds %d bytes", url, maxBytes)
+	}
+	return data, nil
 }
 
 // verifyChecksum confirms data matches the SHA-256 recorded for asset in a
@@ -159,12 +184,12 @@ func httpGet(url string) ([]byte, error) {
 func verifyChecksum(data, sums []byte, asset string) error {
 	want := ""
 	for _, line := range strings.Split(string(sums), "\n") {
-		if strings.Contains(line, asset) {
-			if fields := strings.Fields(line); len(fields) > 0 {
-				want = fields[0]
-			}
-			break
+		fields := strings.Fields(line)
+		if len(fields) != 2 || strings.TrimPrefix(fields[1], "*") != asset {
+			continue
 		}
+		want = fields[0]
+		break
 	}
 	if want == "" {
 		return fmt.Errorf("no checksum recorded for %s", asset)
@@ -197,7 +222,7 @@ func replaceFile(exe string, data []byte) error {
 
 	tmp, err := os.CreateTemp(dir, ".corv-update-*")
 	if err != nil {
-		return fmt.Errorf("cannot write to %s (re-run with sudo, or reinstall): %w", dir, err)
+		return fmt.Errorf("cannot write to %s; install Corv in a writable location or run with permission to modify this installation: %w", dir, err)
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {

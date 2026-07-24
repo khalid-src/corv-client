@@ -9,11 +9,18 @@ on `go install`. Copy the one you need into your agent.
 Copy the skill into your skills directory:
 
 ```bash
-# personal (works everywhere)
+# personal
 cp -r integrations/claude/corv-ssh ~/.claude/skills/
 
 # or per-project
 cp -r integrations/claude/corv-ssh .claude/skills/
+```
+
+PowerShell:
+
+```powershell
+New-Item -ItemType Directory -Force "$HOME\.claude\skills" | Out-Null
+Copy-Item -Recurse integrations\claude\corv-ssh "$HOME\.claude\skills\"
 ```
 
 Claude loads it automatically and uses it when a task involves running
@@ -25,6 +32,12 @@ Copy the instructions into the project Codex is working in:
 
 ```bash
 cp integrations/codex/AGENTS.md ./AGENTS.md
+```
+
+PowerShell:
+
+```powershell
+Copy-Item integrations\codex\AGENTS.md .\AGENTS.md
 ```
 
 (If the project already has an `AGENTS.md`, paste the Corv section into it.)

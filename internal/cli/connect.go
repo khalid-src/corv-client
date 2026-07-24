@@ -22,6 +22,15 @@ import (
 	"github.com/khalid-src/corv-client/internal/vault"
 )
 
+type commandBroker interface {
+	Exec(string, []string) (broker.Response, error)
+}
+
+var (
+	executablePath   = os.Executable
+	newCommandBroker = func(self string) commandBroker { return broker.NewClient(self) }
+)
+
 // runManager opens the TUI, and when the user picks a connection, opens it.
 // After the interactive session ends the TUI reopens (exit-to-home). The loop
 // exits only when the user quits from the home screen (q / Ctrl+C).
@@ -31,7 +40,14 @@ func runManager(d deps, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	var notice string
 	for {
-		name, err := tui.Run(d.store, d.secrets, d.log, stdin, stdout, notice)
+		testConnection := func(name string) (string, error) {
+			result := testSavedConnection(d, name)
+			if result.OK {
+				return name + ": connection test passed", nil
+			}
+			return "", fmt.Errorf("%s: %s", result.failureStage(), result.failureDetail())
+		}
+		name, err := tui.Run(d.store, d.secrets, d.log, stdin, stdout, notice, testConnection)
 		if err != nil {
 			return fail(stderr, err)
 		}
@@ -135,8 +151,13 @@ func interactiveConnect(d deps, reg profile.Registry, p profile.Profile, stderr 
 	if err != nil {
 		return 1, fmt.Errorf("invalid proxy jump %q: %w", p.ProxyJump, err)
 	}
-	sshconn.EnrichJumpChain(jumps, reg, d.jumpSecret)
-	secret := vaultSecret(d, p)
+	if err := sshconn.EnrichJumpChain(jumps, reg, d.jumpSecret); err != nil {
+		return 1, err
+	}
+	secret, err := vaultSecret(d, p)
+	if err != nil {
+		return 1, err
+	}
 	connectingBanner(stderr, p)
 	conn, err := sshconn.Dial(p, sshconn.DialOptions{
 		Password:     secret.Password,
@@ -219,12 +240,18 @@ func disconnectBanner(w io.Writer, p profile.Profile) {
 
 // execCommand runs a command through the broker so the connection is reused.
 func execCommand(d deps, p profile.Profile, command []string, asJSON bool, stdout, stderr io.Writer) int {
-	self, err := os.Executable()
+	self, err := executablePath()
 	if err != nil {
+		if asJSON {
+			return writeExecErrorJSON(stdout, p.Name, "local_error", err.Error())
+		}
 		return fail(stderr, err)
 	}
-	resp, err := broker.NewClient(self).Exec(p.Name, command)
+	resp, err := newCommandBroker(self).Exec(p.Name, command)
 	if err != nil {
+		if asJSON {
+			return writeExecErrorJSON(stdout, p.Name, "disconnected", fmt.Sprintf("broker: %v", err))
+		}
 		return fail(stderr, fmt.Errorf("broker: %w", err))
 	}
 
@@ -234,6 +261,7 @@ func execCommand(d deps, p profile.Profile, command []string, asJSON bool, stdou
 		Command: commandForLog(command), ExitCode: resp.ExitCode,
 		DurationMS: resp.DurationMS,
 		Error:      resp.Kind,
+		RunID:      resp.RunID,
 	})
 
 	code := exitCodeFor(resp)
@@ -257,7 +285,7 @@ func execCommand(d deps, p profile.Profile, command []string, asJSON bool, stdou
 		// exit_code mirrors the process exit code: the remote exit on success,
 		// 75 while running, and nonzero for a transport/setup failure that never
 		// produced a remote exit (so a failure is never reported as exit_code 0).
-		_ = enc.Encode(map[string]any{
+		payload := map[string]any{
 			"connection": p.Name,
 			"exit_code":  code,
 			"stdout":     resp.Stdout,
@@ -267,7 +295,9 @@ func execCommand(d deps, p profile.Profile, command []string, asJSON bool, stdou
 			"running":    resp.Running,
 			"run_id":     resp.RunID,
 			"ok":         resp.OK,
-		})
+		}
+		addOutputMetadata(payload, resp)
+		_ = enc.Encode(payload)
 		return code
 	}
 
@@ -361,21 +391,29 @@ func friendlyDialError(err error) error {
 	return err
 }
 
-func vaultSecret(d deps, p profile.Profile) vault.Secret {
+func vaultSecret(d deps, p profile.Profile) (vault.Secret, error) {
 	if p.SecretRef == "" {
-		return vault.Secret{}
+		return vault.Secret{}, nil
 	}
-	if secret, ok, err := d.secrets.Get(p.SecretRef); err == nil && ok {
-		return secret
+	secret, ok, err := d.secrets.Get(p.SecretRef)
+	if err != nil {
+		return vault.Secret{}, fmt.Errorf("read stored credentials for %q: %w", p.Name, err)
 	}
-	return vault.Secret{}
+	if !ok {
+		return vault.Secret{}, fmt.Errorf("stored credentials for %q were not found", p.Name)
+	}
+	return secret, nil
 }
 
-func (d deps) jumpSecret(ref string) (password, passphrase string) {
-	if secret, ok, err := d.secrets.Get(ref); err == nil && ok {
-		return secret.Password, secret.Passphrase
+func (d deps) jumpSecret(ref string) (password, passphrase string, err error) {
+	secret, ok, err := d.secrets.Get(ref)
+	if err != nil {
+		return "", "", fmt.Errorf("read stored jump credentials %q: %w", ref, err)
 	}
-	return "", ""
+	if !ok {
+		return "", "", fmt.Errorf("stored jump credentials %q were not found", ref)
+	}
+	return secret.Password, secret.Passphrase, nil
 }
 
 type execInput uint8
@@ -427,9 +465,20 @@ func parseExec(args []string) (command []string, asJSON bool, input execInput, e
 }
 
 func readStdinCommand(stdin io.Reader, input execInput) ([]string, error) {
-	data, err := io.ReadAll(stdin)
+	const (
+		maxCommandBytes = 8 * 1024 * 1024
+		maxEncodedBytes = 12 * 1024 * 1024
+	)
+	limit := maxCommandBytes
+	if input == execInputStdinBase64 {
+		limit = maxEncodedBytes
+	}
+	data, err := io.ReadAll(io.LimitReader(stdin, int64(limit+1)))
 	if err != nil {
 		return nil, err
+	}
+	if len(data) > limit {
+		return nil, fmt.Errorf("stdin command exceeds the %d MiB limit", maxCommandBytes/(1024*1024))
 	}
 	if input == execInputStdinBase64 {
 		data, err = base64.StdEncoding.DecodeString(strings.TrimSpace(string(data)))
@@ -438,6 +487,9 @@ func readStdinCommand(stdin io.Reader, input execInput) ([]string, error) {
 		}
 		if !utf8.Valid(data) {
 			return nil, errors.New("--stdin-base64 decoded data is not valid UTF-8")
+		}
+		if len(data) > maxCommandBytes {
+			return nil, fmt.Errorf("decoded stdin command exceeds the %d MiB limit", maxCommandBytes/(1024*1024))
 		}
 	}
 	if input == execInputStdin && !utf8.Valid(data) {

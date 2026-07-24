@@ -6,15 +6,17 @@
 
 **The SSH client for AI agents and humans.** Connect by name. Reuse authenticated SSH connections. Keep secrets local.
 
-AI agents don't use SSH the way humans do. Plain SSH exposes credentials to the caller, returns terminal text that agents
-must parse, re-authenticates every command, and relies on tmux, nohup, or custom
-scripts for long-running tasks.
+AI agents don't use SSH the way humans do. Raw SSH requires the calling workflow
+to manage connection details, authentication configuration, prompts, and
+terminal output. Independent invocations also repeat connection setup unless
+OpenSSH multiplexing is configured, while long-running work commonly needs
+tmux, nohup, or custom scripts.
 
 Corv is built for agent-driven infrastructure. It lets agents connect by name,
 execute commands without exposing passwords or private keys, receive structured
 JSON output, reuse a warm authenticated connection, and detach and resume
-long-running jobs. Humans use the exact same connections through an interactive
-terminal UI.
+long-running jobs. Humans use the same saved connection profiles through an
+interactive terminal UI.
 
 ## Install
 
@@ -63,13 +65,23 @@ import from `~/.ssh/config`, and connect. Connections can also be managed from
 the command line:
 
 ```bash
-corv add srv-01 ubuntu@10.0.0.4                      # prompts for a password if needed
-corv add srv-01 ubuntu@10.0.0.4 --key ~/.ssh/id_ed25519
-corv add db-01 ubuntu@10.0.0.9 --jump ubuntu@bastion # reach through a bastion
+corv add prod-api deploy@api.example.com                    # prompts for a password if needed
+corv add prod-api deploy@api.example.com --key ~/.ssh/id_ed25519
+corv add prod-db dbadmin@db.example.com --jump ops@bastion.example.com
 corv import                                          # import hosts from ~/.ssh/config
 corv list
-corv rm srv-01
+corv test prod-api                                   # diagnose connection stages
+corv status                                          # show warm connections and active runs
+corv rm prod-api
 ```
+
+`corv test <name>` opens and immediately closes a one-off SSH connection. It
+checks resolution, TCP reachability, bastion routing, the SSH handshake,
+host-key trust, and authentication without running a remote command. Add
+`--json` for structured diagnostics. Raw targets and addresses require
+`--full`. `corv status` reports the connections the local broker currently
+holds, hides targets unless `--full` is specified, and does not start a stopped
+broker.
 
 Hosts behind one or more bastions are reached with `--jump` (OpenSSH `-J`
 syntax: `user@host1,user@host2`). Jump hosts authenticate with `ssh-agent`
@@ -78,24 +90,32 @@ or your keys; the target uses the connection's own credentials.
 `corv add` reads any password without echo and stores it in the local
 encrypted vault; it is never passed as an argument.
 
+`corv vault reset` clears stored SSH passwords and private-key passphrases while
+keeping saved connections. It asks for confirmation and stops the local broker
+before changing state. If the encrypted connection store cannot be opened,
+Corv cannot determine whether its key is unavailable or the config file is
+damaged; it refuses a normal reset. `corv vault reset --all` explicitly removes
+the local connection store, vault data, backend marker, and Corv-managed local
+key file. Externally provisioned OS keychain entries are not removed.
+
 Connect interactively:
 
 ```bash
-corv srv-01
+corv prod-api
 ```
 
 Run a command non-interactively (the agent path):
 
 ```bash
-corv srv-01 -- systemctl restart api
-corv srv-01 --json -- df -h              # structured output for tools
-corv srv-01 -- ./deploy.sh
-echo 'cd /app && run "$X" | grep foo' | corv srv-01 --json --stdin
-corv srv-01 --json --stdin < script.sh
+corv prod-api -- uname -a
+corv prod-api --json -- df -h             # structured output for tools
+corv prod-api -- ./deploy.sh
+echo 'cd /app && run "$X" | grep foo' | corv prod-api --json --stdin
+corv prod-api --json --stdin < script.sh
 ```
 
-A typical agent instruction such as "restart the API service on srv-01"
-requires only `corv srv-01 -- systemctl restart api`.
+A typical agent instruction such as "check disk usage on prod-api" requires
+only `corv prod-api -- df -h`.
 
 Command handling after `--` is designed to do what you mean:
 
@@ -105,8 +125,7 @@ Command handling after `--` is designed to do what you mean:
   shell-quoted so the remote cannot re-split them - e.g.
   `corv srv -- sh -lc "cd /app && make"`.
 
-This avoids the raw-`ssh` pitfall where quoted arguments lose their
-boundaries, which matters for agents that build argument vectors.
+This preserves argument boundaries for callers that construct command vectors.
 
 For complex shell text, nested quotes, or multi-line scripts, use an stdin
 mode. `--stdin-base64` is the cross-shell-safe option because only ASCII
@@ -121,7 +140,7 @@ command as UTF-8 base64 and send it with `--stdin-base64`:
 $b64=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(@'
 set -eu
 cd /srv/app && ./deploy.sh
-'@)); $b64 | corv srv-01 --json --stdin-base64
+'@)); $b64 | corv prod-api --json --stdin-base64
 ```
 
 Only ASCII base64 crosses the pipe, so the command arrives unchanged - quoting
@@ -132,14 +151,15 @@ Long commands are detached on the server automatically. If a command is still
 running after the broker's wait window, Corv returns the new bounded output,
 the run id, and exit code `75`. Re-run the exact same command to watch the next
 delta; it attaches to the existing remote job and does not start a second copy.
-When the job finishes, Corv saves the log locally (up to 20 MiB; a larger log is
-truncated, with a marker and a `truncated` flag in `corv output --json`) and
-removes the remote temporary files:
+When the job finishes, Corv retains up to 20 MiB locally and removes the remote
+temporary files. If a log is larger, Corv keeps its first 4 MiB and its final
+section with an omission marker between them, so late failures are not lost.
+`truncated: true` in `corv output --json` reports this case:
 
 ```bash
-corv srv-01 -- ./long-install.sh
-corv srv-01 -- ./long-install.sh       # same command: continue watching
-corv output <run-id>                   # finalize if done, then show the saved log
+corv prod-api -- ./long-install.sh
+corv output <run-id> [pattern]         # bounded status/output view
+# The byte-identical original command can also reattach while it is running.
 ```
 
 `CORV_WAIT` controls how long the broker waits before returning a `running`
@@ -148,8 +168,21 @@ response. It accepts bare seconds (`CORV_WAIT=30`) or a Go duration
 `corv` invocation, so it takes effect immediately without restarting the broker.
 `corv output <run-id>` checks an unfinished detached run and finalizes it
 automatically once the remote exit status exists. Remote temp files are cleaned
-on finalization; abandoned jobs are cleaned by the broker's startup sweep after
-24 hours.
+on finalization. The startup sweep removes completed remote remnants older than
+24 hours; it never deletes a run without an exit status because age alone cannot
+distinguish an abandoned run from a silent live process. Saved local run logs
+and their metadata are retained for 24 hours and removed on broker startup.
+
+`corv output` exits `75` while a run is active, with the remote exit code when
+it completes, and `1` for a Corv retrieval error. The process exit code and JSON
+`exit_code` field use the same value.
+
+All agent-facing output is bounded. Completed responses and `corv output`
+return a middle-out view of roughly 32 KiB; running responses use a smaller
+budget. Pass a pattern to `corv output` to select relevant lines before that
+budget is applied. JSON responses report `original_bytes`, `saved_bytes`,
+`returned_bytes`, `truncated` (the retained log omitted bytes), and
+`output_truncated` (the returned view was bounded) when applicable.
 
 Remote command execution requires a POSIX shell and standard Unix command-line
 tools. Windows OpenSSH servers are not supported as remote execution targets.
@@ -179,19 +212,24 @@ cd /srv/app && ./deploy.sh
 '@)); $b64 | corv <name> --json --stdin-base64
 ```
 
-Agents should not run `corv list --full` or `corv doctor --full` unless the
-user explicitly asks; those modes show local connection details. Never put
-passwords, private keys, API tokens, kubeadm tokens, bearer tokens, or other
+Agents should not run `corv list --full`, `corv doctor --full`, `corv test
+<name> --full`, or `corv status --full` unless the user explicitly asks; those
+modes show local connection details. Never put
+passwords, private keys, API tokens, bootstrap tokens, bearer tokens, or other
 secrets on the command line. Corv command history records command lines.
 
 See [`integrations/README.md`](integrations/README.md) for details.
 
 ## Connection reuse
 
-A local broker process holds one authenticated SSH connection per machine.
+A local broker process holds one authenticated SSH connection per saved profile.
 Each `corv <name> -- <cmd>` runs as a new channel over the held connection, so
 the connection and authentication cost is paid once rather than on every
 command. This behaviour is identical on Linux, macOS, and Windows.
+
+OpenSSH can also reuse connections on Unix through `ControlMaster` and a control
+socket. Corv provides the same warm-connection model through its local broker so
+agent workflows behave consistently on Windows, macOS, and Linux.
 
 The broker starts automatically on first use, exits after 15 minutes idle, and
 installs nothing on the server. It manages SSH connections only; it does not
@@ -199,7 +237,7 @@ allocate a local pseudo-terminal, parse shell output, or maintain remote shell
 state. A held connection can be dropped explicitly:
 
 ```bash
-corv disconnect srv-01
+corv disconnect prod-api
 ```
 
 Scope and limitations:
@@ -227,14 +265,14 @@ Corv normalises command output for programmatic consumers:
   they were written, and returned in `stdout`; with `--json`, the `stderr` field
   carries Corv-level errors (e.g. transport failures), not the remote command's
   own stderr;
-- a finished command returns its output in full up to a generous byte budget;
-  only genuinely large output is trimmed to a leading and trailing section with
-  a `... N line(s) hidden ...` marker (the saved log, up to 20 MiB, stays
-  available via `corv output <run-id>`), and a still-running command returns a
-  short peek;
-- transport failures are classified (`auth_failed`, `unknown_host`,
-  `unreachable`, `host_key`, `timeout`, `disconnected`), and the remote exit
-  code is propagated as the process exit code.
+- completed and running responses use fixed byte budgets and preserve the
+  beginning and end with a `... N line(s) hidden ...` marker; `corv output
+  <run-id> [pattern]` queries the retained log through the same bounded
+  presentation contract;
+- failures are classified (`auth_failed`, `unknown_host`,
+  `unknown_connection`, `bad_request`, `local_error`, `unreachable`,
+  `host_key`, `timeout`, `disconnected`, `resource_exhausted`, `ssh_error`),
+  and the remote exit code is propagated as the process exit code.
 
 ## Security model
 
@@ -242,7 +280,8 @@ Corv runs entirely on the client and implements SSH through the maintained Go
 SSH library (`golang.org/x/crypto/ssh`).
 
 - Nothing is installed on the destination server.
-- Connection profiles are encrypted at rest with the OS-protected vault key,
+- Connection profiles are encrypted at rest with the same local vault key used
+  for stored credentials,
   so the connection file does not expose hosts, users, or paths in plaintext
   (`corv list` is the way to view them).
 - Passwords and key passphrases are stored in a local encrypted vault. The
@@ -254,7 +293,7 @@ SSH library (`golang.org/x/crypto/ssh`).
   or in command output. Key-based authentication or `ssh-agent` is recommended.
 - Audit logs and saved run logs are local and can contain the command text or
   remote output an operator asked Corv to run. Never put passwords, private
-  keys, API tokens, kubeadm tokens, bearer tokens, or other secrets on the
+  keys, API tokens, bootstrap tokens, bearer tokens, or other secrets on the
   command line; command history records command lines.
 - Authentication is attempted in order: configured identity file, `ssh-agent`
   (via `SSH_AUTH_SOCK` on Unix, the `openssh-ssh-agent` named pipe on
@@ -276,29 +315,29 @@ output processor can be replaced without affecting the rest:
 | Package            | Responsibility                                          |
 | ------------------ | ------------------------------------------------------- |
 | `internal/profile` | connection definitions, storage, `~/.ssh/config` import |
-| `internal/vault`   | local encrypted secret store (DPAPI / key file)         |
+| `internal/vault`   | local encrypted secret store and key backends           |
 | `internal/sshconn` | SSH transport (x/crypto/ssh): dial, auth, exec, shell   |
-| `internal/broker`  | resident process holding one connection per host        |
+| `internal/broker`  | resident process holding one connection per profile     |
 | `internal/output`  | output processor (collapse, strip, bound)               |
 | `internal/audit`   | local command history                                   |
 | `internal/tui`     | interactive terminal UI (Bubble Tea)                    |
 | `internal/cli`     | command-line routing                                    |
+| `internal/statelock` | cross-process lock serialising local state writes     |
+| `internal/atomicfile` | crash-safe atomic file writes                        |
 | `internal/paths`   | on-disk file locations                                  |
 
 ## Development
 
 ```bash
-make vet         # go vet ./...
-make build       # build ./bin/corv
-make build-all   # cross-compile linux/macOS/windows
+go build ./...
+go vet ./...
+go test ./...
 ```
 
-Corv targets Go 1.25+ on Linux, macOS, and Windows.
+The Makefile also provides `make build` and `make build-all` on systems with
+`make`. Corv targets Go 1.25+ with automatic toolchain selection; CI and
+release builds use the version pinned in `go.mod` on Linux, macOS, and Windows.
 
 ## License
 
 See [LICENSE](LICENSE).
-
-## Acknowledgments
-
-Built with the assistance of AI coding tools: Claude Opus 4.8 and GPT-5.5.

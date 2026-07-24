@@ -9,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/khalid-src/corv-client/internal/profile"
+	"github.com/khalid-src/corv-client/internal/statelock"
 	"github.com/khalid-src/corv-client/internal/vault"
 )
 
@@ -67,41 +68,44 @@ func (m model) doImport(path string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	reg, err := m.store.Load()
-	if err != nil {
-		return 0, err
-	}
 	added := 0
-	for _, im := range imported {
-		p := im.Profile
-		if _, exists := reg.Get(p.Name); exists {
-			continue
+	err = statelock.WithLock(func() error {
+		reg, err := m.store.Load()
+		if err != nil {
+			return err
 		}
-		if p.IdentityFile == "" && im.KeyMaterial != "" {
-			keyPath, err := profile.WriteIdentityFile(p.Name, im.KeyMaterial)
-			if err != nil {
+		for _, im := range imported {
+			p := im.Profile
+			if _, exists := reg.Get(p.Name); exists {
 				continue
 			}
-			p.IdentityFile = keyPath
-		}
-		// Validate before touching the vault so a bad profile never leaves an
-		// orphaned secret behind.
-		if err := validateProfile(p); err != nil {
-			continue
-		}
-		if im.Password != "" || im.Passphrase != "" {
-			ref := "profile:" + p.Name
-			if err := m.secrets.Set(ref, vault.Secret{Password: im.Password, Passphrase: im.Passphrase}); err != nil {
-				return added, err
+			if p.IdentityFile == "" && im.KeyMaterial != "" {
+				keyPath, err := profile.WriteIdentityFile(p.Name, im.KeyMaterial)
+				if err != nil {
+					continue
+				}
+				p.IdentityFile = keyPath
 			}
-			p.SecretRef = ref
+			// Validate before touching the vault so a bad profile never leaves an
+			// orphaned secret behind.
+			if err := validateProfile(p); err != nil {
+				continue
+			}
+			if im.Password != "" || im.Passphrase != "" {
+				ref := "profile:" + p.Name
+				if err := m.secrets.Set(ref, vault.Secret{Password: im.Password, Passphrase: im.Passphrase}); err != nil {
+					return err
+				}
+				p.SecretRef = ref
+			}
+			if err := reg.Set(p); err != nil {
+				return err
+			}
+			added++
 		}
-		if err := reg.Set(p); err != nil {
-			return added, err
-		}
-		added++
-	}
-	if err := m.store.Save(reg); err != nil {
+		return m.store.Save(reg)
+	})
+	if err != nil {
 		return added, err
 	}
 	return added, nil

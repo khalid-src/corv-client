@@ -134,6 +134,24 @@ func TestImportCSVRequiresHostColumn(t *testing.T) {
 	}
 }
 
+func TestImportCSVPreservesExactSecretBytes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "connections.csv")
+	data := "name,host,password,passphrase\nweb,example.com,\"  pa ss  \",\"  key pass  \"\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ImportCSV(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("profiles = %d, want 1", len(got))
+	}
+	if got[0].Password != "  pa ss  " || got[0].Passphrase != "  key pass  " {
+		t.Fatalf("secrets = password %q, passphrase %q", got[0].Password, got[0].Passphrase)
+	}
+}
+
 func TestImportDispatchByExtension(t *testing.T) {
 	dir := t.TempDir()
 	csvPath := filepath.Join(dir, "x.csv")

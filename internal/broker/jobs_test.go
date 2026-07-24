@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 	"testing"
@@ -31,8 +32,8 @@ func TestTailJobCommandUsesNextByteOffset(t *testing.T) {
 func TestStartJobCommandChecksRemoteToolsAndFallsBackToNohup(t *testing.T) {
 	cmd := startJobCommand("abc123")
 	for _, want := range []string{
-		"command -v tail",
-		"command -v head",
+		"for tool in id tail head wc mkdir chmod cat rm sh",
+		`command -v "$tool"`,
 		"command -v setsid",
 		"command -v nohup",
 		"CORV_NO_POSIX",
@@ -64,11 +65,57 @@ func TestRemoteJobCommandsUsePrivatePerUserDirectory(t *testing.T) {
 	}
 }
 
-func TestFullLogCommandCapsRemoteTransfer(t *testing.T) {
+func TestFullLogCommandRetainsHeadAndTailWithinTransferLimit(t *testing.T) {
 	got := fullLogCommand("abc123")
-	want := fmt.Sprintf("head -c %d", maxLocalLogBytes+1)
-	if !strings.Contains(got, want) {
-		t.Fatalf("full log command = %s, want %q", got, want)
+	for _, want := range []string{
+		"wc -c",
+		fmt.Sprintf("head -c %d", retainedLogHeadBytes),
+		fmt.Sprintf("tail -c %d", retainedLogTailBytes),
+		"CORV_LOG_V1",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("full log command = %s, want %q", got, want)
+		}
+	}
+	if retainedLogHeadBytes+retainedLogTailBytes+retainedLogFrameMargin > maxLocalLogBytes {
+		t.Fatal("retained log payload exceeds the local limit")
+	}
+}
+
+func TestParseRetainedLogPreservesSmallLog(t *testing.T) {
+	raw := []byte("CORV_LOG_V1 12 12 0\nhello world\n")
+	got, err := parseRetainedLog(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got.data) != "hello world\n" || got.originalBytes != 12 || got.truncated {
+		t.Fatalf("retained log = %#v", got)
+	}
+}
+
+func TestParseRetainedLogPreservesLargeLogTail(t *testing.T) {
+	head := bytes.Repeat([]byte("h"), retainedLogHeadBytes)
+	tail := bytes.Repeat([]byte("t"), retainedLogTailBytes)
+	originalBytes := int64(maxLocalLogBytes + 4096)
+	raw := []byte(fmt.Sprintf("CORV_LOG_V1 %d %d %d\n", originalBytes, len(head), len(tail)))
+	raw = append(raw, head...)
+	raw = append(raw, tail...)
+
+	got, err := parseRetainedLog(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.truncated || got.originalBytes != originalBytes {
+		t.Fatalf("retained log = %#v", got)
+	}
+	if len(got.data) > maxLocalLogBytes {
+		t.Fatalf("saved bytes = %d, limit %d", len(got.data), maxLocalLogBytes)
+	}
+	if !bytes.HasPrefix(got.data, head) || !bytes.HasSuffix(got.data, tail) {
+		t.Fatal("retained log lost its head or tail")
+	}
+	if !bytes.Contains(got.data, []byte("bytes omitted")) {
+		t.Fatal("retained log has no omission marker")
 	}
 }
 
@@ -118,15 +165,18 @@ func TestParseWaitPerInvocation(t *testing.T) {
 	}
 }
 
-func TestRemoteSweepProtectsRecentlyActiveJobs(t *testing.T) {
+func TestRemoteSweepRequiresTerminalExitStatus(t *testing.T) {
 	cmd := sweepRemoteCommand()
 	for _, want := range []string{
-		"command -v find",
-		"find \"$log\" -mtime -1",
-		"[ -n \"$recent\" ] && continue",
+		`for rc in "$dir"/*.rc`,
+		`[ -s "$rc" ] || continue`,
+		`rm -f "$dir/$stem.sh" "$dir/$stem.log" "$dir/$stem.rc"`,
 	} {
 		if !strings.Contains(cmd, want) {
 			t.Fatalf("sweep command missing %q: %s", want, cmd)
 		}
+	}
+	if strings.Contains(cmd, "-mtime") {
+		t.Fatalf("sweep command uses log age as liveness: %s", cmd)
 	}
 }

@@ -1,6 +1,8 @@
 package profile
 
 import (
+	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -34,6 +36,34 @@ func TestWriteIdentityFile(t *testing.T) {
 	}
 	if string(data) != "ssh-ed25519 AAAAExample\n" {
 		t.Fatalf("key file content = %q", data)
+	}
+}
+
+func TestWriteIdentityFileFailureKeepsPreviousFile(t *testing.T) {
+	t.Setenv("CORV_HOME", t.TempDir())
+	path, err := WriteIdentityFile("web-1", "old-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	originalWrite := writeFile
+	writeFile = func(string, []byte, os.FileMode) error {
+		return errors.New("replace failed")
+	}
+	t.Cleanup(func() { writeFile = originalWrite })
+	if _, err := WriteIdentityFile("web-1", "new-key"); err == nil {
+		t.Fatal("expected write failure")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("failed write changed the existing key")
 	}
 }
 
@@ -132,5 +162,54 @@ Host bastion
 	}
 	if _, ok := got["*"]; ok {
 		t.Fatal("wildcard host should be skipped")
+	}
+}
+
+func TestImportSSHConfigAppliesDefaultsWithFirstValueWins(t *testing.T) {
+	dir := t.TempDir()
+	config := filepath.Join(dir, "config")
+	if err := os.WriteFile(config, []byte(`
+Host foo
+  HostName foo.internal
+  User deploy
+  User ignored
+
+Host app.internal
+  HostName app.example.com
+
+Host *
+  User default-user
+  Port 22
+  IdentityFile ~/.ssh/default-key
+
+Host *.internal
+  Port 2200
+  ProxyJump bastion
+
+Host foo
+  Port 2022
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	profiles, err := ImportSSHConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]Profile{}
+	for _, p := range profiles {
+		got[p.Name] = p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	foo := got["foo"]
+	if foo.Target != "deploy@foo.internal" || foo.Port != 22 || foo.IdentityFile != filepath.Join(home, ".ssh", "default-key") {
+		t.Fatalf("foo profile = %#v", foo)
+	}
+	app := got["app.internal"]
+	if app.Target != "default-user@app.example.com" || app.Port != 22 || app.ProxyJump != "bastion" {
+		t.Fatalf("app profile = %#v", app)
 	}
 }

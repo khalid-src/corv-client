@@ -2,6 +2,7 @@ package sshconn
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -21,13 +22,15 @@ var defaultKeyNames = []string{"id_ed25519", "id_ecdsa", "id_rsa"}
 func authMethods(identityFile, passphrase, password string) ([]ssh.AuthMethod, []io.Closer, error) {
 	var methods []ssh.AuthMethod
 	var closers []io.Closer
+	var identityErr error
 
 	if identityFile != "" {
 		signer, err := loadKey(identityFile, passphrase)
-		if err != nil {
-			return nil, nil, err
+		if err == nil {
+			methods = append(methods, ssh.PublicKeys(signer))
+		} else {
+			identityErr = err
 		}
-		methods = append(methods, ssh.PublicKeys(signer))
 	}
 
 	if a, closer := agentMethod(); a != nil {
@@ -55,6 +58,9 @@ func authMethods(identityFile, passphrase, password string) ([]ssh.AuthMethod, [
 	}
 
 	if len(methods) == 0 {
+		if identityErr != nil {
+			return nil, closers, fmt.Errorf("load identity file: %w", identityErr)
+		}
 		return nil, closers, errors.New("no authentication methods available (no key, agent, or password)")
 	}
 	return methods, closers, nil

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -19,10 +20,12 @@ type Entry struct {
 	ExitCode   int       `json:"exit_code"`
 	DurationMS int64     `json:"duration_ms"`
 	Error      string    `json:"error,omitempty"`
+	RunID      string    `json:"run_id,omitempty"`
 }
 
 type Log struct {
 	path string
+	mu   sync.Mutex
 }
 
 func NewLog(path string) *Log {
@@ -30,6 +33,12 @@ func NewLog(path string) *Log {
 }
 
 func (l *Log) Append(entry Entry) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.append(entry)
+}
+
+func (l *Log) append(entry Entry) error {
 	if err := os.MkdirAll(filepath.Dir(l.path), 0o700); err != nil {
 		return err
 	}
@@ -64,6 +73,12 @@ func truncateField(s string, max int) string {
 }
 
 func (l *Log) Read(profile string, tail int) ([]Entry, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.read(profile, tail)
+}
+
+func (l *Log) read(profile string, tail int) ([]Entry, error) {
 	file, err := os.Open(l.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -98,8 +113,44 @@ func (l *Log) Read(profile string, tail int) ([]Entry, error) {
 	return entries, nil
 }
 
+// Complete appends the terminal outcome for a previously recorded detached run.
+func (l *Log) Complete(runID string, startedAt, finishedAt time.Time, exitCode int) error {
+	if runID == "" {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entries, err := l.read("", 0)
+	if err != nil {
+		return err
+	}
+	var started *Entry
+	for i := range entries {
+		entry := &entries[i]
+		if entry.RunID != runID {
+			continue
+		}
+		if entry.ExitCode != 75 {
+			return nil
+		}
+		started = entry
+	}
+	if started == nil {
+		return nil
+	}
+	completed := *started
+	completed.StartedAt = startedAt
+	completed.FinishedAt = finishedAt
+	completed.ExitCode = exitCode
+	completed.DurationMS = finishedAt.Sub(startedAt).Milliseconds()
+	completed.Error = ""
+	return l.append(completed)
+}
+
 // Clear removes all recorded entries.
 func (l *Log) Clear() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	err := os.Remove(l.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil

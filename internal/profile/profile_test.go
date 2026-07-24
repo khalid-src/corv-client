@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -107,8 +108,55 @@ func TestStoreOpenWithDifferentKeyFails(t *testing.T) {
 	}
 
 	wrongKey := NewStore(path, testSealer{key: 4})
-	if _, err := wrongKey.Load(); err == nil {
-		t.Fatal("expected decrypt failure with different key")
+	if _, err := wrongKey.Load(); !errors.Is(err, ErrConfigUnreadable) {
+		t.Fatalf("expected ErrConfigUnreadable, got %v", err)
+	}
+}
+
+func TestStoreRemoveFailureIsReported(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	store := NewStore(path, testSealer{key: 1})
+	original := removeFile
+	removeFile = func(string) error { return errors.New("access denied") }
+	t.Cleanup(func() { removeFile = original })
+
+	if err := store.Remove(); err == nil || !strings.Contains(err.Error(), "access denied") {
+		t.Fatalf("remove error = %v", err)
+	}
+}
+
+func TestStoreSaveFailureKeepsPreviousFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	store := NewStore(path, testSealer{key: 5})
+	reg := Registry{}
+	if err := reg.Set(Profile{Name: "old", Target: "old.example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(reg); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	originalWrite := writeFile
+	writeFile = func(string, []byte, os.FileMode) error {
+		return errors.New("replace failed")
+	}
+	t.Cleanup(func() { writeFile = originalWrite })
+	if err := reg.Set(Profile{Name: "new", Target: "new.example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(reg); err == nil {
+		t.Fatal("expected save failure")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("failed save changed the existing profile store")
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -41,7 +42,7 @@ func WriteIdentityFile(name, material string) (string, error) {
 	if !strings.HasSuffix(material, "\n") {
 		material += "\n"
 	}
-	if err := os.WriteFile(path, []byte(material), 0o600); err != nil {
+	if err := writeFile(path, []byte(material), 0o600); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -82,39 +83,84 @@ func importSSHConfig(path string, seen map[string]bool) ([]Profile, error) {
 		return nil, err
 	}
 
-	aliases := map[string]sshConfigBlock{}
+	var names []string
+	seenNames := map[string]bool{}
 	for _, b := range blocks {
 		for _, alias := range b.aliases {
-			if alias != "" && !strings.ContainsAny(alias, "*?") {
-				aliases[alias] = b
+			if alias != "" && !strings.HasPrefix(alias, "!") && !strings.ContainsAny(alias, "*?") && !seenNames[alias] {
+				seenNames[alias] = true
+				names = append(names, alias)
 			}
 		}
+	}
+	aliases := make(map[string]sshConfigBlock, len(names))
+	for _, name := range names {
+		aliases[name] = resolveSSHConfig(name, blocks)
 	}
 
-	var profiles []Profile
-	for _, b := range blocks {
-		for _, alias := range b.aliases {
-			if alias == "" || strings.ContainsAny(alias, "*?") {
-				continue
-			}
-			host := b.hostName
-			if host == "" {
-				host = alias
-			}
-			target := host
-			if b.user != "" {
-				target = fmt.Sprintf("%s@%s", b.user, host)
-			}
-			profiles = append(profiles, Profile{
-				Name:         alias,
-				Target:       target,
-				Port:         b.port,
-				IdentityFile: b.identity,
-				ProxyJump:    resolveProxyJump(b.proxyJump, aliases),
-			})
+	profiles := make([]Profile, 0, len(names))
+	for _, alias := range names {
+		resolved := aliases[alias]
+		host := resolved.hostName
+		if host == "" {
+			host = alias
 		}
+		target := host
+		if resolved.user != "" {
+			target = fmt.Sprintf("%s@%s", resolved.user, host)
+		}
+		profiles = append(profiles, Profile{
+			Name:         alias,
+			Target:       target,
+			Port:         resolved.port,
+			IdentityFile: resolved.identity,
+			ProxyJump:    resolveProxyJump(resolved.proxyJump, aliases),
+		})
 	}
 	return profiles, nil
+}
+
+func resolveSSHConfig(name string, blocks []sshConfigBlock) sshConfigBlock {
+	var resolved sshConfigBlock
+	for _, block := range blocks {
+		if !hostBlockMatches(name, block.aliases) {
+			continue
+		}
+		if resolved.hostName == "" {
+			resolved.hostName = block.hostName
+		}
+		if resolved.user == "" {
+			resolved.user = block.user
+		}
+		if resolved.port == 0 {
+			resolved.port = block.port
+		}
+		if resolved.identity == "" {
+			resolved.identity = block.identity
+		}
+		if resolved.proxyJump == "" {
+			resolved.proxyJump = block.proxyJump
+		}
+	}
+	return resolved
+}
+
+func hostBlockMatches(name string, patterns []string) bool {
+	name = strings.ToLower(name)
+	matched := false
+	for _, pattern := range patterns {
+		negated := strings.HasPrefix(pattern, "!")
+		pattern = strings.TrimPrefix(strings.ToLower(pattern), "!")
+		ok, err := pathpkg.Match(pattern, name)
+		if err != nil || !ok {
+			continue
+		}
+		if negated {
+			return false
+		}
+		matched = true
+	}
+	return matched
 }
 
 type sshConfigBlock struct {
@@ -155,31 +201,32 @@ func parseSSHConfig(path string, seen map[string]bool) ([]sshConfigBlock, error)
 			flush()
 			cur = &sshConfigBlock{aliases: strings.Fields(value)}
 		case "include":
+			flush()
 			included, err := parseIncludes(path, value, seen)
 			if err != nil {
 				return nil, err
 			}
 			blocks = append(blocks, included...)
 		case "hostname":
-			if cur != nil {
+			if cur != nil && cur.hostName == "" {
 				cur.hostName = value
 			}
 		case "user":
-			if cur != nil {
+			if cur != nil && cur.user == "" {
 				cur.user = value
 			}
 		case "port":
-			if cur != nil {
+			if cur != nil && cur.port == 0 {
 				if p, err := strconv.Atoi(value); err == nil {
 					cur.port = p
 				}
 			}
 		case "identityfile":
-			if cur != nil {
+			if cur != nil && cur.identity == "" {
 				cur.identity = expandHome(value)
 			}
 		case "proxyjump":
-			if cur != nil {
+			if cur != nil && cur.proxyJump == "" {
 				cur.proxyJump = value
 			}
 		}

@@ -2,6 +2,7 @@ package sshconn
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -27,6 +28,7 @@ const (
 var (
 	keepaliveInterval = 15 * time.Second
 	keepaliveTimeout  = 15 * time.Second
+	lookupCurrentUser = user.Current
 )
 
 // DialOptions configures a connection attempt.
@@ -67,7 +69,11 @@ func Dial(p profile.Profile, opt DialOptions) (*Conn, error) {
 
 	user, host := splitTarget(p.Target)
 	if user == "" {
-		user = currentUser()
+		resolved, resolveErr := currentUser()
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		user = resolved
 	}
 	port := p.Port
 	if port == 0 {
@@ -104,7 +110,7 @@ func Dial(p profile.Profile, opt DialOptions) (*Conn, error) {
 	}
 
 	addr := joinHostPort(host, port)
-	client, err := ssh.Dial("tcp", addr, cfg)
+	client, err := dialClient(addr, cfg, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -234,7 +240,11 @@ func (c *Conn) keepalive() {
 func dialViaJumps(p profile.Profile, opt DialOptions) (*Conn, error) {
 	userName, host := splitTarget(p.Target)
 	if userName == "" {
-		userName = currentUser()
+		resolved, resolveErr := currentUser()
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		userName = resolved
 	}
 	port := p.Port
 	if port == 0 {
@@ -276,7 +286,11 @@ func dialViaJumps(p profile.Profile, opt DialOptions) (*Conn, error) {
 	for i, hop := range opt.JumpHosts {
 		hopUser := hop.User
 		if hopUser == "" {
-			hopUser = currentUser()
+			hopUser, err = currentUser()
+			if err != nil {
+				closeClients()
+				return nil, fmt.Errorf("determine user for jump host %s: %w", hop.Host, err)
+			}
 		}
 		hopPort := hop.Port
 		if hopPort == 0 {
@@ -298,7 +312,7 @@ func dialViaJumps(p profile.Profile, opt DialOptions) (*Conn, error) {
 
 		var client *ssh.Client
 		if i == 0 {
-			client, err = ssh.Dial("tcp", addr, cfg)
+			client, err = dialClient(addr, cfg, timeout)
 		} else {
 			client, err = dialThrough(previous, addr, cfg, timeout)
 		}
@@ -324,6 +338,17 @@ func dialViaJumps(p profile.Profile, opt DialOptions) (*Conn, error) {
 	}
 	clients = append(clients, target)
 	return newConn(clients, p), nil
+}
+
+func dialClient(addr string, cfg *ssh.ClientConfig, timeout time.Duration) (*ssh.Client, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	dialer := net.Dialer{Timeout: timeout}
+	nc, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return newClientThroughContext(ctx, nc, addr, cfg)
 }
 
 func dialThrough(parent *ssh.Client, addr string, cfg *ssh.ClientConfig, timeout time.Duration) (*ssh.Client, error) {
@@ -414,14 +439,24 @@ func splitTarget(target string) (user, host string) {
 	return "", unbracketHost(target)
 }
 
-func currentUser() string {
-	if u, err := user.Current(); err == nil && u.Username != "" {
-		// On Windows the username can be DOMAIN\user; keep only the name.
-		name := u.Username
-		if i := strings.LastIndexAny(name, `\/`); i >= 0 {
-			name = name[i+1:]
+func currentUser() (string, error) {
+	if u, err := lookupCurrentUser(); err == nil {
+		if name := normalizeUsername(u.Username); name != "" {
+			return name, nil
 		}
-		return name
 	}
-	return "root"
+	for _, key := range []string{"USER", "USERNAME"} {
+		if name := normalizeUsername(os.Getenv(key)); name != "" {
+			return name, nil
+		}
+	}
+	return "", errors.New("remote user is required because the local username could not be determined")
+}
+
+func normalizeUsername(name string) string {
+	name = strings.TrimSpace(name)
+	if i := strings.LastIndexAny(name, `\/`); i >= 0 {
+		name = name[i+1:]
+	}
+	return name
 }

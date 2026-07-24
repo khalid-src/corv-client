@@ -87,12 +87,12 @@ func (m model) titleBar() string {
 func (m model) statusLine() string {
 	switch {
 	case m.err != "":
-		return badStyle.Render("✗ " + m.err)
+		return badStyle.Render(m.err)
 	case m.notice != "":
 		// Connection/return notices in the brand violet so they read as Corv.
 		return accentBold.Render("● " + m.notice)
 	case m.message != "":
-		return goodStyle.Render("✓ " + m.message)
+		return goodStyle.Render(m.message)
 	default:
 		return " "
 	}

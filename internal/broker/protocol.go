@@ -7,7 +7,7 @@
 // The broker owns SSH connections only. It does not own a local
 // pseudo-terminal, parse shell prompts, or keep remote shell state; commands
 // are protocol-level exec requests with exact exit codes. Interactive shells
-// do not go through the broker. This keeps it lean and robust.
+// do not go through the broker. This keeps its responsibilities narrow.
 package broker
 
 import "time"
@@ -21,6 +21,7 @@ const (
 	OpOutput   Op = "output"   // read a completed run log
 	OpClose    Op = "close"    // drop a profile's held connection
 	OpList     Op = "list"     // list held connections
+	OpStatus   Op = "status"   // describe held connections
 	OpShutdown Op = "shutdown" // stop the broker
 )
 
@@ -40,24 +41,38 @@ type Request struct {
 
 // Response is the broker's reply.
 type Response struct {
-	OK          bool       `json:"ok"`
-	ExitCode    int        `json:"exit_code,omitempty"`
-	Stdout      string     `json:"stdout,omitempty"`
-	Stderr      string     `json:"stderr,omitempty"`
-	DurationMS  int64      `json:"duration_ms,omitempty"`
-	Kind        string     `json:"kind,omitempty"`
-	Error       string     `json:"error,omitempty"`
-	Highlights  []string   `json:"highlights,omitempty"`
-	Running     bool       `json:"running,omitempty"`
-	RunID       string     `json:"run_id,omitempty"`
-	Connection  string     `json:"connection,omitempty"`
-	StartedAt   *time.Time `json:"started_at,omitempty"`
-	FinishedAt  *time.Time `json:"finished_at,omitempty"`
-	Truncated   bool       `json:"truncated,omitempty"`
-	RunMetadata bool       `json:"run_metadata,omitempty"`
+	OK              bool       `json:"ok"`
+	ExitCode        int        `json:"exit_code,omitempty"`
+	Stdout          string     `json:"stdout,omitempty"`
+	Stderr          string     `json:"stderr,omitempty"`
+	DurationMS      int64      `json:"duration_ms,omitempty"`
+	Kind            string     `json:"kind,omitempty"`
+	Error           string     `json:"error,omitempty"`
+	Highlights      []string   `json:"highlights,omitempty"`
+	Running         bool       `json:"running,omitempty"`
+	RunID           string     `json:"run_id,omitempty"`
+	Connection      string     `json:"connection,omitempty"`
+	StartedAt       *time.Time `json:"started_at,omitempty"`
+	FinishedAt      *time.Time `json:"finished_at,omitempty"`
+	Truncated       bool       `json:"truncated,omitempty"`
+	RunMetadata     bool       `json:"run_metadata,omitempty"`
+	OutputTruncated bool       `json:"output_truncated,omitempty"`
+	OriginalBytes   int64      `json:"original_bytes,omitempty"`
+	SavedBytes      int64      `json:"saved_bytes,omitempty"`
+	ReturnedBytes   int64      `json:"returned_bytes,omitempty"`
 
 	// Held lists active connections, for OpList.
 	Held []HeldInfo `json:"held,omitempty"`
+	// Connections describes active connections, for OpStatus.
+	Connections []StatusInfo `json:"connections,omitempty"`
+}
+
+// StatusInfo describes one warm connection and its active work.
+type StatusInfo struct {
+	Name        string `json:"name"`
+	Target      string `json:"target"`
+	IdleMS      int64  `json:"idle_ms"`
+	RunningJobs int    `json:"running_jobs"`
 }
 
 // HeldInfo describes one warm connection.

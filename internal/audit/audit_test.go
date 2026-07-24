@@ -75,3 +75,35 @@ func TestLogReadSurvivesOversizedLine(t *testing.T) {
 		t.Fatalf("did not recover the good entry after the oversized line: %#v", entries)
 	}
 }
+
+func TestCompleteAppendsDetachedRunOutcomeOnce(t *testing.T) {
+	log := NewLog(filepath.Join(t.TempDir(), "audit.jsonl"))
+	started := time.Now().UTC().Add(-time.Minute)
+	finished := started.Add(45 * time.Second)
+	if err := log.Append(Entry{
+		StartedAt: finished.Add(time.Second),
+		Profile:   "srv1",
+		Command:   "deploy",
+		ExitCode:  75,
+		RunID:     "run-123",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Complete("run-123", started, finished, 23); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Complete("run-123", started, finished, 23); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := log.Read("", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(entries))
+	}
+	got := entries[1]
+	if got.RunID != "run-123" || got.ExitCode != 23 || !got.FinishedAt.Equal(finished) || got.DurationMS != 45000 {
+		t.Fatalf("completion = %#v", got)
+	}
+}

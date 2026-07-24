@@ -7,13 +7,17 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/khalid-src/corv-client/internal/atomicfile"
 )
+
+var writeJobFile = atomicfile.Write
 
 type jobRecord struct {
 	Key         string `json:"key"`
 	RunID       string `json:"run_id"`
 	Profile     string `json:"profile"`
-	Command     string `json:"command"`
+	Command     string `json:"command,omitempty"`
 	Fingerprint string `json:"fingerprint"`
 	RemoteDir   string `json:"remote_dir"`
 	LogPath     string `json:"log_path"`
@@ -73,30 +77,26 @@ func saveJobRegistry(reg jobRegistry) error {
 	if reg.Jobs == nil {
 		reg.Jobs = map[string]jobRecord{}
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(reg, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return writeJobFile(path, data, 0o600)
 }
 
 func newJobRecord(profile string, j *job) jobRecord {
+	key := j.key
+	if key == "" {
+		key = jobKey(profile, j.command)
+	}
 	var finishedAt int64
 	if !j.finishedAt.IsZero() {
 		finishedAt = j.finishedAt.UnixNano()
 	}
 	return jobRecord{
-		Key:         jobKey(profile, j.command),
+		Key:         key,
 		RunID:       j.id,
 		Profile:     profile,
-		Command:     j.command,
 		Fingerprint: j.fingerprint,
 		RemoteDir:   remoteJobDir,
 		LogPath:     remoteLogPath(j.id),
@@ -120,13 +120,14 @@ func recordToJob(rec jobRecord) *job {
 	}
 	return &job{
 		id:          rec.RunID,
+		key:         rec.Key,
 		command:     rec.Command,
 		fingerprint: rec.Fingerprint,
 		offset:      rec.Offset,
 		started:     true,
 		startedAt:   startedAt,
 		finishedAt:  finishedAt,
-		done:        rec.Status == jobStatusDone || rec.Status == jobStatusFailed,
+		done:        rec.Status == jobStatusDone || rec.Status == jobStatusFinalizePending || rec.Status == jobStatusFailed,
 		exitCode:    rec.ExitCode,
 		status:      rec.Status,
 	}

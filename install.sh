@@ -34,7 +34,7 @@ echo "Downloading ${asset} ..."
 curl -fsSL "${base}/${asset}" -o "$tmp"
 curl -fsSL "${base}/SHA256SUMS" -o "$sums"
 
-expected=$(grep "$asset" "$sums" | awk '{print $1}' | head -n1)
+expected=$(awk -v a="$asset" '{sub(/^\*/, "", $2); if ($2 == a) print $1}' "$sums" | head -n1)
 if [ -z "$expected" ]; then
 	echo "corv: no checksum for ${asset} in SHA256SUMS; refusing to install" >&2
 	exit 1
@@ -52,9 +52,12 @@ fi
 chmod +x "$tmp"
 if [ -w "$bindir" ]; then
 	mv "$tmp" "${bindir}/corv"
-else
+elif command -v sudo >/dev/null 2>&1; then
 	echo "Installing to ${bindir} (requires sudo) ..."
 	sudo mv "$tmp" "${bindir}/corv"
+else
+	echo "corv: ${bindir} is not writable and sudo is unavailable; set BINDIR to a writable directory" >&2
+	exit 1
 fi
 trap - EXIT
 rm -f "$sums"

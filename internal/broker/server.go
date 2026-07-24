@@ -11,14 +11,17 @@ import (
 	"log"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/khalid-src/corv-client/internal/audit"
 	"github.com/khalid-src/corv-client/internal/paths"
 	"github.com/khalid-src/corv-client/internal/profile"
 	"github.com/khalid-src/corv-client/internal/sshconn"
+	"github.com/khalid-src/corv-client/internal/statelock"
 	"github.com/khalid-src/corv-client/internal/vault"
 	"github.com/khalid-src/corv-client/internal/version"
 )
@@ -32,6 +35,7 @@ var brokerLog = log.New(os.Stderr, "corv broker: ", log.LstdFlags)
 const idleTimeout = 15 * time.Minute
 
 var controlOpTimeout = 30 * time.Second
+var fullLogTransferTimeout = 2 * time.Minute
 
 var errStartUncertain = errors.New("remote job start outcome is uncertain")
 
@@ -43,6 +47,7 @@ type entry struct {
 	conn        *sshconn.Conn
 	target      string
 	fingerprint string
+	snapshot    connectionSnapshot
 	dialing     bool
 	closed      bool
 	lastUsed    time.Time
@@ -50,10 +55,19 @@ type entry struct {
 	swept       bool
 }
 
+type connectionSnapshot struct {
+	profile     profile.Profile
+	registry    profile.Registry
+	secret      vault.Secret
+	jumps       []sshconn.JumpHost
+	fingerprint string
+}
+
 // server holds the warm connections and serves IPC requests.
 type server struct {
 	store   *profile.Store
 	secrets *vault.Store
+	audit   *audit.Log
 
 	mu      sync.Mutex
 	entries map[string]*entry
@@ -79,6 +93,7 @@ func Serve() error {
 	s := &server{
 		store:    profile.NewStore(p.ConfigFile, secrets),
 		secrets:  secrets,
+		audit:    audit.NewLog(p.AuditFile),
 		entries:  map[string]*entry{},
 		jobs:     jobs,
 		activity: make(chan struct{}, 1),
@@ -90,10 +105,18 @@ func Serve() error {
 		return err
 	}
 	s.brokerAddr = addr
-	defer ln.Close()
-	defer cleanupBroker(addr)
+	var published endpoint
+	defer func() {
+		_ = ln.Close()
+		if published.Addr == "" || removeEndpointIfOwned(published) {
+			cleanupBroker(addr)
+		}
+	}()
 
-	token := newToken()
+	token, err := newToken()
+	if err != nil {
+		return fmt.Errorf("generate broker token: %w", err)
+	}
 	ep := endpoint{
 		Addr:    addr,
 		Token:   token,
@@ -110,7 +133,7 @@ func Serve() error {
 	if err := writeEndpoint(ep); err != nil {
 		return err
 	}
-	defer removeEndpoint()
+	published = ep
 
 	stop := make(chan struct{})
 	var stopOnce sync.Once
@@ -179,6 +202,8 @@ func (s *server) handle(conn net.Conn, token string) bool {
 		writeResp(conn, Response{OK: true})
 	case OpList:
 		writeResp(conn, Response{OK: true, Held: s.list()})
+	case OpStatus:
+		writeResp(conn, Response{OK: true, Connections: s.status()})
 	case OpShutdown:
 		writeResp(conn, Response{OK: true})
 		return true
@@ -195,21 +220,18 @@ func writeResp(conn net.Conn, resp Response) {
 // exec resolves the profile, attaches to an existing detached job when one
 // is running for the same command, or starts a new one.
 func (s *server) exec(req Request) Response {
-	reg, err := s.store.Load()
+	snapshot, ok, err := s.loadConnectionSnapshot(req.Name)
 	if err != nil {
-		return Response{OK: false, Error: err.Error()}
+		return Response{OK: false, Error: err.Error(), Kind: "local_error"}
 	}
-	p, ok := reg.Get(req.Name)
 	if !ok {
 		return Response{OK: false, Error: "unknown connection: " + req.Name}
 	}
-
-	fingerprint, err := s.profileFingerprint(p, reg)
-	if err != nil {
-		return Response{OK: false, Error: err.Error()}
-	}
+	p := snapshot.profile
+	reg := snapshot.registry
+	fingerprint := snapshot.fingerprint
 	e := s.entryFor(req.Name)
-	s.prepareEntry(e, p.Name, fingerprint)
+	s.prepareEntry(e, snapshot)
 	command := sshconn.CommandString(req.Command)
 	j := s.jobFor(e, p.Name, command, fingerprint)
 	if err := s.ensureJobStarted(e, p, reg, j); err != nil {
@@ -238,7 +260,7 @@ func (s *server) exec(req Request) Response {
 	return resp
 }
 
-func (s *server) connFor(e *entry, p profile.Profile, reg profile.Registry, fingerprint string) (*sshconn.Conn, error) {
+func (s *server) connFor(e *entry, fingerprint string) (*sshconn.Conn, error) {
 	for {
 		e.mu.Lock()
 		if e.closed {
@@ -268,9 +290,10 @@ func (s *server) connFor(e *entry, p profile.Profile, reg profile.Registry, fing
 			continue
 		}
 		e.dialing = true
+		snapshot := e.snapshot
 		e.mu.Unlock()
 
-		conn, err := s.dial(p, reg)
+		conn, err := s.dialSnapshot(snapshot)
 
 		e.mu.Lock()
 		e.dialing = false
@@ -288,7 +311,7 @@ func (s *server) connFor(e *entry, p profile.Profile, reg profile.Registry, fing
 			return nil, errors.New("connection profile changed during dial")
 		}
 		e.conn = conn
-		e.target = p.Target
+		e.target = snapshot.profile.Target
 		e.lastUsed = time.Now()
 		shouldSweep := !e.swept
 		e.swept = true
@@ -318,15 +341,22 @@ func (s *server) runRaw(e *entry, p profile.Profile, reg profile.Registry, cmd s
 }
 
 func (s *server) runRawStdin(e *entry, p profile.Profile, reg profile.Registry, cmd string, stdin []byte, maxBytes int64) (sshconn.RawResult, error) {
-	fingerprint, err := s.profileFingerprint(p, reg)
+	return s.runRawStdinTimeout(e, p, reg, cmd, stdin, maxBytes, controlOpTimeout)
+}
+
+func (s *server) runRawTimeout(e *entry, p profile.Profile, reg profile.Registry, cmd string, maxBytes int64, timeout time.Duration) (sshconn.RawResult, error) {
+	return s.runRawStdinTimeout(e, p, reg, cmd, nil, maxBytes, timeout)
+}
+
+func (s *server) runRawStdinTimeout(e *entry, p profile.Profile, reg profile.Registry, cmd string, stdin []byte, maxBytes int64, timeout time.Duration) (sshconn.RawResult, error) {
+	e.mu.Lock()
+	fingerprint := e.fingerprint
+	e.mu.Unlock()
+	conn, err := s.connFor(e, fingerprint)
 	if err != nil {
 		return sshconn.RawResult{}, err
 	}
-	conn, err := s.connFor(e, p, reg, fingerprint)
-	if err != nil {
-		return sshconn.RawResult{}, err
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), controlOpTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	res := conn.ExecRawStdin(ctx, cmd, stdin, maxBytes)
 	cancel()
 	if res.Kind == sshconn.ErrTimeout {
@@ -335,11 +365,11 @@ func (s *server) runRawStdin(e *entry, p profile.Profile, reg profile.Registry, 
 	}
 	if res.Kind == sshconn.ErrDisconnect && !res.Started {
 		s.resetConn(e)
-		conn, err = s.connFor(e, p, reg, fingerprint)
+		conn, err = s.connFor(e, fingerprint)
 		if err != nil {
 			return sshconn.RawResult{}, err
 		}
-		ctx, cancel = context.WithTimeout(context.Background(), controlOpTimeout)
+		ctx, cancel = context.WithTimeout(context.Background(), timeout)
 		res = conn.ExecRawStdin(ctx, cmd, stdin, maxBytes)
 		cancel()
 	}
@@ -347,22 +377,22 @@ func (s *server) runRawStdin(e *entry, p profile.Profile, reg profile.Registry, 
 }
 
 func (s *server) dial(p profile.Profile, reg profile.Registry) (*sshconn.Conn, error) {
-	secret := vault.Secret{}
-	if p.SecretRef != "" {
-		if stored, ok, err := s.secrets.Get(p.SecretRef); err == nil && ok {
-			secret = stored
-		}
-	}
-	jumps, err := sshconn.ParseJumpChain(p.ProxyJump)
+	snapshot, err := s.connectionSnapshotFor(p, reg)
 	if err != nil {
-		return nil, fmt.Errorf("invalid proxy jump %q: %w", p.ProxyJump, err)
+		return nil, err
 	}
-	sshconn.EnrichJumpChain(jumps, reg, s.jumpSecret)
+	return s.dialSnapshot(snapshot)
+}
+
+func (s *server) dialSnapshot(snapshot connectionSnapshot) (*sshconn.Conn, error) {
+	p := snapshot.profile
+	secret := vault.Secret{}
+	secret = snapshot.secret
 	opt := sshconn.DialOptions{
 		Password:     secret.Password,
 		Passphrase:   secret.Passphrase,
 		AllowNewHost: false,
-		JumpHosts:    jumps,
+		JumpHosts:    snapshot.jumps,
 	}
 	if testDialOptions != nil {
 		testOpt := testDialOptions(p)
@@ -374,11 +404,15 @@ func (s *server) dial(p profile.Profile, reg profile.Registry) (*sshconn.Conn, e
 }
 
 // jumpSecret resolves a profile's vault reference for sshconn.EnrichJumpChain.
-func (s *server) jumpSecret(ref string) (password, passphrase string) {
-	if secret, ok, err := s.secrets.Get(ref); err == nil && ok {
-		return secret.Password, secret.Passphrase
+func (s *server) jumpSecret(ref string) (password, passphrase string, err error) {
+	secret, ok, err := s.secrets.Get(ref)
+	if err != nil {
+		return "", "", fmt.Errorf("read stored jump credentials %q: %w", ref, err)
 	}
-	return "", ""
+	if !ok {
+		return "", "", fmt.Errorf("stored jump credentials %q were not found", ref)
+	}
+	return secret.Password, secret.Passphrase, nil
 }
 
 func (s *server) entryFor(name string) *entry {
@@ -394,51 +428,78 @@ func (s *server) entryFor(name string) *entry {
 }
 
 func (s *server) jobFor(e *entry, profileName, command, fingerprint string) *job {
+	key := jobKey(profileName, command)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.jobs == nil {
 		e.jobs = map[string]*job{}
 	}
-	if j, ok := e.jobs[command]; ok && j.fingerprint == fingerprint {
-		if !j.finished() {
+	if j, ok := e.jobs[key]; ok && j.fingerprint == fingerprint {
+		if !j.finished() || j.finalizePending() {
 			return j
 		}
 	}
 	if rec, ok := s.persistedJob(profileName, command); ok &&
 		(rec.Fingerprint == "" || rec.Fingerprint == fingerprint) &&
-		(rec.Status == jobStatusStarting || rec.Status == jobStatusRunning) {
+		(rec.Status == jobStatusStarting || rec.Status == jobStatusRunning || rec.Status == jobStatusFinalizePending) {
 		j := recordToJob(rec)
+		j.key = key
+		j.command = command
 		j.fingerprint = fingerprint
-		e.jobs[command] = j
+		e.jobs[key] = j
 		return j
 	}
 	j := newJob(command, fingerprint)
-	e.jobs[command] = j
+	j.key = key
+	e.jobs[key] = j
 	return j
 }
 
-func (s *server) removeJob(e *entry, profileName, command string, j *job) {
+func (s *server) removeJob(e *entry, profileName, key string, j *job) {
+	if j.key != "" {
+		key = j.key
+	} else {
+		key = jobKey(profileName, key)
+	}
 	e.mu.Lock()
-	if e.jobs[command] == j {
-		delete(e.jobs, command)
+	if e.jobs[key] == j {
+		delete(e.jobs, key)
 	}
 	e.mu.Unlock()
-	s.deletePersistedJob(profileName, command)
+	s.deletePersistedJobByKey(key)
 }
 
 func (s *server) list() []HeldInfo {
+	status := s.status()
+	out := make([]HeldInfo, 0, len(status))
+	for _, info := range status {
+		out = append(out, HeldInfo{Name: info.Name, Target: info.Target, IdleMS: info.IdleMS})
+	}
+	return out
+}
+
+func (s *server) status() []StatusInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var out []HeldInfo
+	var out []StatusInfo
 	for name, e := range s.entries {
 		e.mu.Lock()
 		if e.conn == nil {
 			e.mu.Unlock()
 			continue
 		}
-		out = append(out, HeldInfo{Name: name, Target: e.target, IdleMS: time.Since(e.lastUsed).Milliseconds()})
+		runningJobs := 0
+		for _, j := range e.jobs {
+			if !j.finished() {
+				runningJobs++
+			}
+		}
+		out = append(out, StatusInfo{
+			Name: name, Target: e.target, IdleMS: time.Since(e.lastUsed).Milliseconds(), RunningJobs: runningJobs,
+		})
 		e.mu.Unlock()
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
@@ -480,14 +541,18 @@ func (s *server) closeAll() {
 	}
 }
 
-func (s *server) prepareEntry(e *entry, profileName, fingerprint string) {
+func (s *server) prepareEntry(e *entry, snapshot connectionSnapshot) {
+	profileName := snapshot.profile.Name
+	fingerprint := snapshot.fingerprint
 	e.mu.Lock()
 	if e.fingerprint == "" {
 		e.fingerprint = fingerprint
+		e.snapshot = snapshot
 		e.mu.Unlock()
 		return
 	}
 	if e.fingerprint == fingerprint {
+		e.snapshot = snapshot
 		e.mu.Unlock()
 		return
 	}
@@ -495,6 +560,7 @@ func (s *server) prepareEntry(e *entry, profileName, fingerprint string) {
 	e.conn = nil
 	e.target = ""
 	e.fingerprint = fingerprint
+	e.snapshot = snapshot
 	e.jobs = map[string]*job{}
 	e.swept = false
 	e.mu.Unlock()
@@ -507,12 +573,31 @@ func (s *server) prepareEntry(e *entry, profileName, fingerprint string) {
 	}
 }
 
-func (s *server) profileFingerprint(p profile.Profile, reg profile.Registry) (string, error) {
+func (s *server) loadConnectionSnapshot(name string) (connectionSnapshot, bool, error) {
+	var snapshot connectionSnapshot
+	var found bool
+	err := statelock.WithLock(func() error {
+		reg, err := s.store.Load()
+		if err != nil {
+			return err
+		}
+		p, ok := reg.Get(name)
+		if !ok {
+			return nil
+		}
+		found = true
+		snapshot, err = s.connectionSnapshotFor(p, reg)
+		return err
+	})
+	return snapshot, found, err
+}
+
+func (s *server) connectionSnapshotFor(p profile.Profile, reg profile.Registry) (connectionSnapshot, error) {
 	secret := vault.Secret{}
 	if p.SecretRef != "" {
 		stored, ok, err := s.secrets.Get(p.SecretRef)
 		if err != nil {
-			return "", fmt.Errorf("read credentials for %s: %w", p.Name, err)
+			return connectionSnapshot{}, fmt.Errorf("read stored credentials for %q: %w", p.Name, err)
 		}
 		if ok {
 			secret = stored
@@ -520,9 +605,11 @@ func (s *server) profileFingerprint(p profile.Profile, reg profile.Registry) (st
 	}
 	jumps, err := sshconn.ParseJumpChain(p.ProxyJump)
 	if err != nil {
-		return "", fmt.Errorf("invalid proxy jump %q: %w", p.ProxyJump, err)
+		return connectionSnapshot{}, fmt.Errorf("invalid proxy jump %q: %w", p.ProxyJump, err)
 	}
-	sshconn.EnrichJumpChain(jumps, reg, s.jumpSecret)
+	if err := sshconn.EnrichJumpChain(jumps, reg, s.jumpSecret); err != nil {
+		return connectionSnapshot{}, err
+	}
 
 	credentials := sha256.Sum256([]byte(secret.Password + "\x00" + secret.Passphrase))
 	sum := sha256.New()
@@ -549,7 +636,13 @@ func (s *server) profileFingerprint(p profile.Profile, reg profile.Registry) (st
 			_, _ = sum.Write([]byte{0})
 		}
 	}
-	return fmt.Sprintf("%x", sum.Sum(nil)), nil
+	return connectionSnapshot{
+		profile:     p,
+		registry:    reg,
+		secret:      secret,
+		jumps:       jumps,
+		fingerprint: fmt.Sprintf("%x", sum.Sum(nil)),
+	}, nil
 }
 
 func (s *server) touch() {
@@ -645,14 +738,18 @@ func (s *server) currentJob(profileName string, j *job) bool {
 		return false
 	}
 	e.mu.Lock()
-	current := e.jobs[j.command] == j && e.fingerprint == j.fingerprint
+	key := j.key
+	if key == "" {
+		key = jobKey(profileName, j.command)
+	}
+	current := e.jobs[key] == j && e.fingerprint == j.fingerprint
 	e.mu.Unlock()
 	return current
 }
 
-func (s *server) deletePersistedJob(profileName, command string) {
+func (s *server) deletePersistedJobByKey(key string) {
 	s.jobsMu.Lock()
-	delete(s.jobs.Jobs, jobKey(profileName, command))
+	delete(s.jobs.Jobs, key)
 	_ = saveJobRegistry(s.jobs)
 	s.jobsMu.Unlock()
 }
