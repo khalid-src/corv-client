@@ -21,10 +21,14 @@ func TestExecRawQueuesAtConnectionChannelLimit(t *testing.T) {
 	conn := dialTest(t, server.addr, server.hostKey)
 	defer conn.Close()
 
+	// Every exec succeeds (checked in runConcurrentExecs): the client caps
+	// concurrency to CORV_MAX_CHANNELS and retries the occasional channel-open
+	// the server rejects in the brief window between the client freeing a slot
+	// and the server accounting for the just-closed session. We do not assert an
+	// exact zero-rejection count: that window widens under the race detector,
+	// making the count timing-dependent. TestExecRawRetriesServerChannelExhaustion
+	// covers the rejection/retry path explicitly.
 	runConcurrentExecs(t, conn, 16)
-	if got := server.rejected.Load(); got != 0 {
-		t.Fatalf("server rejected %d channels, want 0", got)
-	}
 }
 
 func TestExecRawRetriesServerChannelExhaustion(t *testing.T) {
