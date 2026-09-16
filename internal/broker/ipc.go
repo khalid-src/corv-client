@@ -19,13 +19,14 @@ var tokenReader io.Reader = rand.Reader
 // the Corv root; the token gates access so another local user cannot drive
 // the broker over its per-user socket (Unix) or named pipe (Windows).
 type endpoint struct {
-	Addr       string `json:"addr"`
-	Token      string `json:"token"`
-	PID        int    `json:"pid"`
-	Version    string `json:"version,omitempty"`
-	ExePath    string `json:"exe_path,omitempty"`
-	ExeModTime int64  `json:"exe_mod_time,omitempty"`
-	ExeSize    int64  `json:"exe_size,omitempty"`
+	Addr         string `json:"addr"`
+	Token        string `json:"token"`
+	PID          int    `json:"pid"`
+	Version      string `json:"version,omitempty"`
+	ExePath      string `json:"exe_path,omitempty"`
+	ExeModTime   int64  `json:"exe_mod_time,omitempty"`
+	ExeSize      int64  `json:"exe_size,omitempty"`
+	ProcessStart uint64 `json:"process_start,omitempty"`
 }
 
 func endpointPath() (string, error) {

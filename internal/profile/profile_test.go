@@ -96,6 +96,30 @@ func TestStoreMigratesLegacyPlaintext(t *testing.T) {
 	}
 }
 
+func TestLoadReadOnlyDoesNotMigrateLegacyPlaintext(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	data := []byte("{\"profiles\":{\"srv1\":{\"name\":\"srv1\",\"target\":\"user@host\"}}}\n")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(path, testSealer{key: 0x5a})
+	reg, err := store.LoadReadOnly()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reg.Get("srv1"); !ok {
+		t.Fatal("legacy profile was not loaded")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, data) {
+		t.Fatal("read-only load migrated the profile store")
+	}
+}
+
 func TestStoreOpenWithDifferentKeyFails(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	store := NewStore(path, testSealer{key: 3})

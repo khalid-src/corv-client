@@ -128,3 +128,29 @@ func TestReplaceFileWriteErrorIsPlatformNeutral(t *testing.T) {
 		t.Fatalf("write error = %q", message)
 	}
 }
+
+func TestWindowsReplacementReportsRollbackFailure(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "corv.exe")
+	replacement := filepath.Join(dir, "replacement.exe")
+	if err := os.WriteFile(replacement, []byte("NEW"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	originalRename := renameUpdateFile
+	calls := 0
+	renameUpdateFile = func(_, _ string) error {
+		calls++
+		if calls == 1 {
+			return nil
+		}
+		if calls == 2 {
+			return errors.New("install failed")
+		}
+		return errors.New("rollback failed")
+	}
+	t.Cleanup(func() { renameUpdateFile = originalRename })
+	err := replaceWindowsFile(exe, replacement)
+	if err == nil || !strings.Contains(err.Error(), "install failed") || !strings.Contains(err.Error(), "restore previous executable") || !strings.Contains(err.Error(), "rollback failed") {
+		t.Fatalf("error = %v", err)
+	}
+}

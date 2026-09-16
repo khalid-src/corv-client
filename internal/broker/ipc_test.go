@@ -23,13 +23,14 @@ func TestEndpointRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	ep := endpoint{
-		Addr:       "127.0.0.1:12345",
-		Token:      token,
-		PID:        42,
-		Version:    "v1.0.0",
-		ExePath:    "corv",
-		ExeModTime: 123,
-		ExeSize:    456,
+		Addr:         "127.0.0.1:12345",
+		Token:        token,
+		PID:          42,
+		Version:      "v1.0.0",
+		ExePath:      "corv",
+		ExeModTime:   123,
+		ExeSize:      456,
+		ProcessStart: 789,
 	}
 	if err := writeEndpoint(ep); err != nil {
 		t.Fatal(err)
@@ -138,5 +139,15 @@ func TestTokenGenerationFailureIsReturned(t *testing.T) {
 	t.Cleanup(func() { tokenReader = original })
 	if _, err := newToken(); !errors.Is(err, io.EOF) {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestProcessStartIDIdentifiesCurrentProcess(t *testing.T) {
+	id, err := processStartID(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id == 0 {
+		t.Fatal("current process has an empty start identity")
 	}
 }

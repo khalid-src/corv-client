@@ -2,6 +2,8 @@ package vault
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -223,5 +225,45 @@ func TestVaultSaveFailureKeepsPreviousFile(t *testing.T) {
 	}
 	if !bytes.Equal(after, before) {
 		t.Fatal("failed save changed the existing vault")
+	}
+}
+
+func TestFingerprintIsStableAndKeyBound(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vault.json")
+	keyPath := filepath.Join(dir, "vault.key")
+	store := New(path, keyPath)
+
+	first, err := store.Fingerprint([]byte("connection-state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened := New(path, keyPath)
+	second, err := reopened.Fingerprint([]byte("connection-state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := reopened.Fingerprint([]byte("different-state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := New(filepath.Join(dir, "other-vault.json"), filepath.Join(dir, "other-vault.key"))
+	otherKey, err := other.Fingerprint([]byte("connection-state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := sha256.Sum256([]byte("connection-state"))
+
+	if first != second {
+		t.Fatalf("fingerprint changed after reopening store: %q != %q", first, second)
+	}
+	if first == changed {
+		t.Fatal("different connection state produced the same fingerprint")
+	}
+	if first == otherKey {
+		t.Fatal("different vault keys produced the same fingerprint")
+	}
+	if first == hex.EncodeToString(plain[:]) {
+		t.Fatal("fingerprint is an unkeyed digest")
 	}
 }

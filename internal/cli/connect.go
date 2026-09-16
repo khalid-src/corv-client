@@ -18,12 +18,14 @@ import (
 	"github.com/khalid-src/corv-client/internal/broker"
 	"github.com/khalid-src/corv-client/internal/profile"
 	"github.com/khalid-src/corv-client/internal/sshconn"
+	"github.com/khalid-src/corv-client/internal/statelock"
 	"github.com/khalid-src/corv-client/internal/tui"
 	"github.com/khalid-src/corv-client/internal/vault"
 )
 
 type commandBroker interface {
 	Exec(string, []string) (broker.Response, error)
+	ExecKeyed(string, []string, string) (broker.Response, error)
 }
 
 var (
@@ -86,14 +88,14 @@ func cmdConnect(d deps, args []string, stdin io.Reader, stdout, stderr io.Writer
 
 	rest := args[1:]
 	if len(rest) == 0 {
-		code, err := interactiveConnect(d, reg, p, stderr)
+		code, err := interactiveConnect(d, p.Name, stderr)
 		if err != nil {
 			return fail(stderr, err)
 		}
 		return code
 	}
 
-	command, asJSON, input, err := parseExec(rest)
+	command, asJSON, input, runKey, err := parseExec(rest)
 	if err != nil {
 		if wantsJSON(rest) {
 			return writeExecErrorJSON(stdout, name, "bad_request", err.Error())
@@ -109,7 +111,7 @@ func cmdConnect(d deps, args []string, stdin io.Reader, stdout, stderr io.Writer
 			return fail(stderr, err)
 		}
 	}
-	return execCommand(d, p, command, asJSON, stdout, stderr)
+	return execCommandKeyed(d, p, command, asJSON, runKey, stdout, stderr)
 }
 
 func wantsJSON(args []string) bool {
@@ -146,25 +148,24 @@ func writeExecErrorJSON(stdout io.Writer, name, kind, message string) int {
 // It returns an error only when the connection could not be established; a
 // session that opens and then ends (even with a non-zero shell code) returns
 // a nil error so the caller can quietly return to the home screen.
-func interactiveConnect(d deps, reg profile.Registry, p profile.Profile, stderr io.Writer) (int, error) {
-	jumps, err := sshconn.ParseJumpChain(p.ProxyJump)
-	if err != nil {
-		return 1, fmt.Errorf("invalid proxy jump %q: %w", p.ProxyJump, err)
-	}
-	if err := sshconn.EnrichJumpChain(jumps, reg, d.jumpSecret); err != nil {
-		return 1, err
-	}
-	secret, err := vaultSecret(d, p)
+func interactiveConnect(d deps, name string, stderr io.Writer) (int, error) {
+	state, ok, err := loadConnectionState(d, name)
 	if err != nil {
 		return 1, err
 	}
-	connectingBanner(stderr, p)
+	if !ok {
+		return 1, fmt.Errorf("unknown connection %q", name)
+	}
+	if state.authErr != nil {
+		return 1, state.authErr
+	}
+	p := state.profile
 	conn, err := sshconn.Dial(p, sshconn.DialOptions{
-		Password:     secret.Password,
-		Passphrase:   secret.Passphrase,
+		Password:     state.secret.Password,
+		Passphrase:   state.secret.Passphrase,
 		AllowNewHost: true,
 		Prompt:       hostKeyPrompt(stderr),
-		JumpHosts:    jumps,
+		JumpHosts:    state.jumps,
 	})
 	if err != nil {
 		return 1, friendlyDialError(err)
@@ -178,27 +179,22 @@ func interactiveConnect(d deps, reg profile.Registry, p profile.Profile, stderr 
 		return 1, err
 	}
 	disconnectBanner(stderr, p)
-	_ = d.log.Append(audit.Entry{
+	if err := d.log.Append(audit.Entry{
 		StartedAt: start, FinishedAt: time.Now(),
 		Profile: p.Name, Target: p.Target,
 		Command: "<interactive>", ExitCode: code,
 		DurationMS: time.Since(start).Milliseconds(),
-	})
+		Status:     "completed",
+	}); err != nil {
+		fmt.Fprintln(stderr, "corv warning: local command history could not be written")
+	}
 	return code, nil
 }
 
 // openInteractive looks up name and opens a live shell. Used by the TUI manager
 // loop; it returns an error only when the connection could not be established.
 func openInteractive(d deps, name string, stderr io.Writer) error {
-	reg, err := d.store.Load()
-	if err != nil {
-		return err
-	}
-	p, ok := reg.Get(name)
-	if !ok {
-		return fmt.Errorf("unknown connection %q", name)
-	}
-	_, err = interactiveConnect(d, reg, p, stderr)
+	_, err := interactiveConnect(d, name, stderr)
 	return err
 }
 
@@ -210,24 +206,13 @@ const (
 	cReset  = "\x1b[0m"
 )
 
-// connectBanner and disconnectBanner frame an interactive session in Corv's
-// brand violet so entering and leaving a host visibly feels like Corv. They
-// are suppressed when stdout is not a terminal (e.g. redirected output).
-// connectingBanner shows, in brand violet, that Corv is dialing - so the wait
-// during a slow or unreachable connect reads as Corv working, not a hang.
-func connectingBanner(w io.Writer, p profile.Profile) {
-	if !term.IsTerminal(int(os.Stdout.Fd())) {
-		return
-	}
-	fmt.Fprintln(w, cViolet+"● corv"+cReset+cDim+" connecting to "+cReset+
-		cViolet+p.Name+cReset+"  "+cDim+p.Target+cReset)
-}
-
+// connectBanner and disconnectBanner identify interactive session boundaries.
+// Both are suppressed when stdout is not a terminal.
 func connectBanner(w io.Writer, p profile.Profile) {
 	if !term.IsTerminal(int(os.Stdout.Fd())) {
 		return
 	}
-	fmt.Fprintln(w, cViolet+"● corv"+cReset+cDim+" connected to "+cReset+
+	fmt.Fprintln(w, cViolet+"corv"+cReset+cDim+" connected to "+cReset+
 		cViolet+p.Name+cReset+"  "+cDim+p.Target+cReset)
 }
 
@@ -235,11 +220,15 @@ func disconnectBanner(w io.Writer, p profile.Profile) {
 	if !term.IsTerminal(int(os.Stdout.Fd())) {
 		return
 	}
-	fmt.Fprintln(w, cViolet+"● corv"+cReset+cDim+" disconnected from "+p.Name+cReset)
+	fmt.Fprintln(w, cViolet+"corv"+cReset+cDim+" disconnected from "+p.Name+cReset)
 }
 
 // execCommand runs a command through the broker so the connection is reused.
 func execCommand(d deps, p profile.Profile, command []string, asJSON bool, stdout, stderr io.Writer) int {
+	return execCommandKeyed(d, p, command, asJSON, "", stdout, stderr)
+}
+
+func execCommandKeyed(d deps, p profile.Profile, command []string, asJSON bool, runKey string, stdout, stderr io.Writer) int {
 	self, err := executablePath()
 	if err != nil {
 		if asJSON {
@@ -247,7 +236,7 @@ func execCommand(d deps, p profile.Profile, command []string, asJSON bool, stdou
 		}
 		return fail(stderr, err)
 	}
-	resp, err := newCommandBroker(self).Exec(p.Name, command)
+	resp, err := newCommandBroker(self).ExecKeyed(p.Name, command, runKey)
 	if err != nil {
 		if asJSON {
 			return writeExecErrorJSON(stdout, p.Name, "disconnected", fmt.Sprintf("broker: %v", err))
@@ -255,14 +244,23 @@ func execCommand(d deps, p profile.Profile, command []string, asJSON bool, stdou
 		return fail(stderr, fmt.Errorf("broker: %w", err))
 	}
 
-	_ = d.log.Append(audit.Entry{
+	status := "completed"
+	if resp.Running {
+		status = "running"
+	} else if resp.RunID != "" && !resp.RunMetadata && resp.Kind != "" {
+		status = "pending"
+	}
+	if err := d.log.Append(audit.Entry{
 		StartedAt: time.Now(), FinishedAt: time.Now(),
 		Profile: p.Name, Target: p.Target,
 		Command: commandForLog(command), ExitCode: resp.ExitCode,
 		DurationMS: resp.DurationMS,
 		Error:      resp.Kind,
 		RunID:      resp.RunID,
-	})
+		Status:     status,
+	}); err != nil {
+		resp.Highlights = append(resp.Highlights, "local command history could not be written")
+	}
 
 	code := exitCodeFor(resp)
 
@@ -416,6 +414,56 @@ func (d deps) jumpSecret(ref string) (password, passphrase string, err error) {
 	return secret.Password, secret.Passphrase, nil
 }
 
+type connectionState struct {
+	profile profile.Profile
+	jumps   []sshconn.JumpHost
+	secret  vault.Secret
+	authErr error
+}
+
+type connectionStateError struct {
+	stage string
+	kind  string
+	err   error
+}
+
+func (e *connectionStateError) Error() string { return e.err.Error() }
+func (e *connectionStateError) Unwrap() error { return e.err }
+
+func loadConnectionState(d deps, name string) (connectionState, bool, error) {
+	var state connectionState
+	var found bool
+	err := statelock.WithLock(func() error {
+		reg, err := d.store.Load()
+		if err != nil {
+			return &connectionStateError{stage: "local", kind: "local_error", err: err}
+		}
+		p, ok := reg.Get(name)
+		if !ok {
+			return nil
+		}
+		found = true
+		jumps, err := sshconn.ParseJumpChain(p.ProxyJump)
+		if err != nil {
+			return &connectionStateError{
+				stage: "jump",
+				kind:  "bad_request",
+				err:   fmt.Errorf("invalid proxy jump %q: %w", p.ProxyJump, err),
+			}
+		}
+		if err := sshconn.EnrichJumpChain(jumps, reg, nil); err != nil {
+			return &connectionStateError{stage: "jump", kind: "bad_request", err: err}
+		}
+		state = connectionState{profile: p, jumps: jumps}
+		state.secret, state.authErr = vaultSecret(d, p)
+		if state.authErr == nil {
+			state.authErr = sshconn.EnrichJumpChain(state.jumps, reg, d.jumpSecret)
+		}
+		return nil
+	})
+	return state, found, err
+}
+
 type execInput uint8
 
 const (
@@ -424,44 +472,69 @@ const (
 	execInputStdinBase64
 )
 
-func parseExec(args []string) (command []string, asJSON bool, input execInput, err error) {
+func parseExec(args []string) (command []string, asJSON bool, input execInput, runKey string, err error) {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--json":
 			asJSON = true
 		case "--stdin":
 			if input != execInputArgs {
-				return nil, false, execInputArgs, errors.New("--stdin cannot be combined with another input mode")
+				return nil, false, execInputArgs, "", errors.New("--stdin cannot be combined with another input mode")
 			}
 			if command != nil {
-				return nil, false, execInputArgs, errors.New("--stdin cannot be combined with -- <command>")
+				return nil, false, execInputArgs, "", errors.New("--stdin cannot be combined with -- <command>")
 			}
 			input = execInputStdin
 		case "--stdin-base64":
 			if input != execInputArgs {
-				return nil, false, execInputArgs, errors.New("--stdin-base64 cannot be combined with another input mode")
+				return nil, false, execInputArgs, "", errors.New("--stdin-base64 cannot be combined with another input mode")
 			}
 			if command != nil {
-				return nil, false, execInputArgs, errors.New("--stdin-base64 cannot be combined with -- <command>")
+				return nil, false, execInputArgs, "", errors.New("--stdin-base64 cannot be combined with -- <command>")
 			}
 			input = execInputStdinBase64
+		case "--run-key":
+			i++
+			if i >= len(args) {
+				return nil, asJSON, execInputArgs, "", errors.New("--run-key requires a value")
+			}
+			if runKey != "" {
+				return nil, asJSON, execInputArgs, "", errors.New("--run-key may be specified only once")
+			}
+			runKey = args[i]
+			if !validRunKeyArg(runKey) {
+				return nil, asJSON, execInputArgs, "", errors.New("run key must be 1-128 characters using letters, numbers, '.', '_', ':', or '-'")
+			}
 		case "--":
 			if input != execInputArgs {
-				return nil, false, execInputArgs, errors.New("stdin input cannot be combined with -- <command>")
+				return nil, false, execInputArgs, "", errors.New("stdin input cannot be combined with -- <command>")
 			}
 			command = args[i+1:]
 			if len(command) == 0 {
-				return nil, false, execInputArgs, errors.New("-- requires a command")
+				return nil, false, execInputArgs, "", errors.New("-- requires a command")
 			}
-			return command, asJSON, execInputArgs, nil
+			return command, asJSON, execInputArgs, runKey, nil
 		default:
-			return nil, false, execInputArgs, fmt.Errorf("unexpected argument %q; use: corv <name> [--json] (--stdin | --stdin-base64 | -- <command>)", args[i])
+			return nil, false, execInputArgs, "", fmt.Errorf("unexpected argument %q; use: corv <name> [--json] [--run-key KEY] (--stdin | --stdin-base64 | -- <command>)", args[i])
 		}
 	}
 	if input != execInputArgs {
-		return nil, asJSON, input, nil
+		return nil, asJSON, input, runKey, nil
 	}
-	return nil, false, execInputArgs, errors.New("usage: corv <name> [--json] (--stdin | --stdin-base64 | -- <command>)")
+	return nil, false, execInputArgs, "", errors.New("usage: corv <name> [--json] [--run-key KEY] (--stdin | --stdin-base64 | -- <command>)")
+}
+
+func validRunKeyArg(key string) bool {
+	if len(key) < 1 || len(key) > 128 {
+		return false
+	}
+	for _, r := range key {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == ':' || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func readStdinCommand(stdin io.Reader, input execInput) ([]string, error) {

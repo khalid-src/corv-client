@@ -73,6 +73,17 @@ func NewStore(path string, sealer Sealer) *Store {
 // Load reads the registry from disk. A missing or empty file is treated as
 // an empty registry rather than an error, so the first run starts clean.
 func (s *Store) Load() (Registry, error) {
+	return s.load(true)
+}
+
+// LoadReadOnly reads the registry without performing the legacy plaintext
+// migration used by Load. It is intended for diagnostics that must not mutate
+// local state.
+func (s *Store) LoadReadOnly() (Registry, error) {
+	return s.load(false)
+}
+
+func (s *Store) load(migrateLegacy bool) (Registry, error) {
 	data, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) || (err == nil && len(data) == 0) {
 		return Registry{Profiles: map[string]Profile{}}, nil
@@ -80,13 +91,14 @@ func (s *Store) Load() (Registry, error) {
 	if err != nil {
 		return Registry{}, err
 	}
-	if !bytes.HasPrefix(bytes.TrimSpace(data), []byte("{")) {
+	legacyPlaintext := bytes.HasPrefix(bytes.TrimSpace(data), []byte("{"))
+	if !legacyPlaintext {
 		if s.sealer == nil {
 			return Registry{}, errors.New("profile store sealer is required")
 		}
 		opened, err := s.sealer.Open(bytes.TrimSpace(data))
 		if err != nil {
-			return Registry{}, fmt.Errorf("%w: %v", ErrConfigUnreadable, err)
+			return Registry{}, fmt.Errorf("%w: %w", ErrConfigUnreadable, err)
 		}
 		data = opened
 	}
@@ -98,11 +110,9 @@ func (s *Store) Load() (Registry, error) {
 	if reg.Profiles == nil {
 		reg.Profiles = map[string]Profile{}
 	}
-	if bytes.HasPrefix(bytes.TrimSpace(data), []byte("{")) {
-		if raw, err := os.ReadFile(s.path); err == nil && bytes.HasPrefix(bytes.TrimSpace(raw), []byte("{")) {
-			if err := s.Save(reg); err != nil {
-				return Registry{}, err
-			}
+	if legacyPlaintext && migrateLegacy {
+		if err := s.Save(reg); err != nil {
+			return Registry{}, err
 		}
 	}
 	return reg, nil

@@ -23,6 +23,9 @@ func listenBroker() (net.Listener, string, error) {
 	if err := os.MkdirAll(runDir, 0o700); err != nil {
 		return nil, "", err
 	}
+	if err := os.Chmod(runDir, 0o700); err != nil {
+		return nil, "", err
+	}
 	addr := filepath.Join(runDir, "broker.sock")
 	// Unix socket paths are length-limited (~104 bytes on macOS, ~108 on Linux).
 	// When the Corv home is deep (e.g. a long temp dir), fall back to a short,
@@ -37,6 +40,11 @@ func listenBroker() (net.Listener, string, error) {
 	_ = os.Remove(addr)
 	ln, err := net.Listen("unix", addr)
 	if err != nil {
+		return nil, "", err
+	}
+	if err := os.Chmod(addr, 0o600); err != nil {
+		_ = ln.Close()
+		_ = os.Remove(addr)
 		return nil, "", err
 	}
 	return ln, addr, nil

@@ -213,3 +213,47 @@ Host foo
 		t.Fatalf("app profile = %#v", app)
 	}
 }
+
+func TestImportSSHConfigPreservesContextAcrossNestedIncludes(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "conf.d"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "conf.d", "global"), []byte("IdentityFile ~/.ssh/global-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "nested"), []byte("Port 2201\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "app.inc"), []byte("Include nested\nProxyJump bastion\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(dir, "config")
+	if err := os.WriteFile(config, []byte(`
+User global-user
+Include conf.d/global
+
+Host app
+  Include app.inc
+  HostName app.internal
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	profiles, err := ImportSSHConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(profiles) != 1 {
+		t.Fatalf("profiles = %#v", profiles)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := profiles[0]
+	if got.Name != "app" || got.Target != "global-user@app.internal" || got.Port != 2201 ||
+		got.IdentityFile != filepath.Join(home, ".ssh", "global-key") || got.ProxyJump != "bastion" {
+		t.Fatalf("profile = %#v", got)
+	}
+}

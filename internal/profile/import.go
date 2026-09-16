@@ -30,15 +30,14 @@ func TrimPath(p string) string {
 // private (0600) key file under the Corv home and returns its path. Profile
 // names are already filename-safe (see nameRE), so they are used verbatim.
 func WriteIdentityFile(name, material string) (string, error) {
-	p, err := paths.Default()
+	path, err := IdentityFilePath(name)
 	if err != nil {
 		return "", err
 	}
-	dir := filepath.Join(p.Root, "keys")
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, name+".key")
 	if !strings.HasSuffix(material, "\n") {
 		material += "\n"
 	}
@@ -46,6 +45,15 @@ func WriteIdentityFile(name, material string) (string, error) {
 		return "", err
 	}
 	return path, nil
+}
+
+// IdentityFilePath returns the managed path used for inline key material.
+func IdentityFilePath(name string) (string, error) {
+	p, err := paths.Default()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(p.Root, "keys", name+".key"), nil
 }
 
 // ImportSSHConfig parses an OpenSSH client config file and returns the
@@ -69,15 +77,6 @@ func ImportSSHConfig(path string) ([]Profile, error) {
 }
 
 func importSSHConfig(path string, seen map[string]bool) ([]Profile, error) {
-	abs, err := filepath.Abs(path)
-	if err == nil {
-		path = abs
-	}
-	if seen[path] {
-		return nil, nil
-	}
-	seen[path] = true
-
 	blocks, err := parseSSHConfig(path, seen)
 	if err != nil {
 		return nil, err
@@ -173,21 +172,36 @@ type sshConfigBlock struct {
 }
 
 func parseSSHConfig(path string, seen map[string]bool) ([]sshConfigBlock, error) {
-	file, err := os.Open(path)
-	if err != nil {
+	parser := sshConfigParser{active: seen}
+	if err := parser.parseFile(path); err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	parser.flush()
+	return parser.blocks, nil
+}
 
-	var blocks []sshConfigBlock
-	var cur *sshConfigBlock
+type sshConfigParser struct {
+	blocks  []sshConfigBlock
+	current *sshConfigBlock
+	active  map[string]bool
+}
 
-	flush := func() {
-		if cur != nil {
-			blocks = append(blocks, *cur)
-			cur = nil
-		}
+func (p *sshConfigParser) parseFile(path string) error {
+	abs, err := filepath.Abs(path)
+	if err == nil {
+		path = abs
 	}
+	if p.active[path] {
+		return nil
+	}
+	p.active[path] = true
+	defer delete(p.active, path)
+
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -198,71 +212,62 @@ func parseSSHConfig(path string, seen map[string]bool) ([]sshConfigBlock, error)
 		key, value := splitConfigLine(line)
 		switch strings.ToLower(key) {
 		case "host":
-			flush()
-			cur = &sshConfigBlock{aliases: strings.Fields(value)}
+			p.flush()
+			p.current = &sshConfigBlock{aliases: strings.Fields(value)}
 		case "include":
-			flush()
-			included, err := parseIncludes(path, value, seen)
-			if err != nil {
-				return nil, err
+			for _, pattern := range strings.Fields(value) {
+				for _, match := range includeMatches(filepath.Dir(path), pattern) {
+					if err := p.parseFile(match); err != nil {
+						return err
+					}
+				}
 			}
-			blocks = append(blocks, included...)
 		case "hostname":
-			if cur != nil && cur.hostName == "" {
-				cur.hostName = value
+			p.ensureCurrent()
+			if p.current.hostName == "" {
+				p.current.hostName = value
 			}
 		case "user":
-			if cur != nil && cur.user == "" {
-				cur.user = value
+			p.ensureCurrent()
+			if p.current.user == "" {
+				p.current.user = value
 			}
 		case "port":
-			if cur != nil && cur.port == 0 {
-				if p, err := strconv.Atoi(value); err == nil {
-					cur.port = p
+			p.ensureCurrent()
+			if p.current.port == 0 {
+				if port, err := strconv.Atoi(value); err == nil {
+					p.current.port = port
 				}
 			}
 		case "identityfile":
-			if cur != nil && cur.identity == "" {
-				cur.identity = expandHome(value)
+			p.ensureCurrent()
+			if p.current.identity == "" {
+				p.current.identity = expandHome(value)
 			}
 		case "proxyjump":
-			if cur != nil && cur.proxyJump == "" {
-				cur.proxyJump = value
+			p.ensureCurrent()
+			if p.current.proxyJump == "" {
+				p.current.proxyJump = value
 			}
 		}
 	}
-	flush()
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		return err
 	}
-	return blocks, nil
+	return nil
 }
 
-func parseIncludes(path, value string, seen map[string]bool) ([]sshConfigBlock, error) {
-	var blocks []sshConfigBlock
-	for _, pattern := range strings.Fields(value) {
-		matches := includeMatches(filepath.Dir(path), pattern)
-		for _, match := range matches {
-			included, err := parseSSHConfigFile(match, seen)
-			if err != nil {
-				return nil, err
-			}
-			blocks = append(blocks, included...)
-		}
+func (p *sshConfigParser) ensureCurrent() {
+	if p.current == nil {
+		p.current = &sshConfigBlock{aliases: []string{"*"}}
 	}
-	return blocks, nil
 }
 
-func parseSSHConfigFile(path string, seen map[string]bool) ([]sshConfigBlock, error) {
-	abs, err := filepath.Abs(path)
-	if err == nil {
-		path = abs
+func (p *sshConfigParser) flush() {
+	if p.current != nil {
+		p.blocks = append(p.blocks, *p.current)
+		p.current = nil
 	}
-	if seen[path] {
-		return nil, nil
-	}
-	seen[path] = true
-	return parseSSHConfig(path, seen)
 }
 
 func includeMatches(baseDir, pattern string) []string {

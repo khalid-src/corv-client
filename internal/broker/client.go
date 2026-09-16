@@ -20,6 +20,7 @@ var spawnBroker = func(c *Client) error {
 }
 
 var brokerProcessExited = processExited
+var brokerProcessStart = processStartID
 
 // Client talks to the resident broker, starting it on first use.
 type Client struct {
@@ -35,10 +36,16 @@ func NewClient(self string) *Client {
 // Exec runs a command on a profile through the warm connection, starting the
 // broker if it is not already running.
 func (c *Client) Exec(name string, command []string) (Response, error) {
+	return c.ExecKeyed(name, command, "")
+}
+
+// ExecKeyed runs a command with a caller-supplied replay-suppression key.
+func (c *Client) ExecKeyed(name string, command []string, runKey string) (Response, error) {
 	return c.request(Request{
 		Op:      OpExec,
 		Name:    name,
 		Command: command,
+		RunKey:  runKey,
 		Wait:    os.Getenv("CORV_WAIT"),
 	})
 }
@@ -46,6 +53,18 @@ func (c *Client) Exec(name string, command []string) (Response, error) {
 // Output reads a completed run log through the broker.
 func (c *Client) Output(runID, pattern string) (Response, error) {
 	return c.request(Request{Op: OpOutput, RunID: runID, Pattern: pattern})
+}
+
+// Jobs lists active and recently retained detached runs.
+func (c *Client) Jobs() ([]RunInfo, error) {
+	resp, err := c.request(Request{Op: OpJobs})
+	if err != nil {
+		return nil, err
+	}
+	if !resp.OK {
+		return nil, errors.New(resp.Error)
+	}
+	return resp.Runs, nil
 }
 
 // Close drops a profile's held connection. If the broker is not running
@@ -94,7 +113,13 @@ func (c *Client) Status() (bool, []StatusInfo, error) {
 	}
 	resp, err := roundTrip(ep, Request{Op: OpStatus})
 	if err != nil {
-		return false, nil, nil
+		if ep.PID > 0 {
+			exited, processErr := brokerProcessExited(ep.PID)
+			if processErr == nil && exited {
+				return false, nil, nil
+			}
+		}
+		return false, nil, fmt.Errorf("inspect broker: %w", err)
 	}
 	if !resp.OK {
 		if strings.EqualFold(strings.TrimSpace(resp.Error), "unknown op") {
@@ -217,6 +242,15 @@ func (c *Client) stopStaleBroker() error {
 		}
 		return nil
 	}
+	if ep.ProcessStart == 0 && !alive {
+		return nil
+	}
+	if ep.ProcessStart != 0 {
+		id, err := brokerProcessStart(ep.PID)
+		if err == nil && id != ep.ProcessStart {
+			return nil
+		}
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		exited, err := brokerProcessExited(ep.PID)
@@ -225,6 +259,12 @@ func (c *Client) stopStaleBroker() error {
 		}
 		if exited {
 			return nil
+		}
+		if ep.ProcessStart != 0 {
+			id, err := brokerProcessStart(ep.PID)
+			if err == nil && id != ep.ProcessStart {
+				return nil
+			}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -236,7 +276,10 @@ func (c *Client) spawn() error {
 	if err != nil {
 		return err
 	}
-	logFile, _ := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("open broker log: %w", err)
+	}
 
 	cmd := exec.Command(c.self, "__broker")
 	cmd.Stdin = nil
@@ -244,7 +287,13 @@ func (c *Client) spawn() error {
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = detachSysProcAttr()
 	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
 		return fmt.Errorf("start broker: %w", err)
+	}
+	if err := logFile.Close(); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Process.Release()
+		return fmt.Errorf("close broker log: %w", err)
 	}
 	// Detach: do not wait on the broker; let it outlive us.
 	_ = cmd.Process.Release()

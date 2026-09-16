@@ -3,8 +3,11 @@ package vault
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +31,10 @@ type Store struct {
 	backend     string
 	mu          sync.Mutex
 }
+
+// ErrKeyAccess reports that the configured vault key backend exists but is
+// unavailable to the current process context.
+var ErrKeyAccess = errors.New("vault key is not accessible to this process")
 
 type encryptedVault struct {
 	Version int               `json:"version"`
@@ -85,6 +92,21 @@ func (s *Store) Open(ciphertext []byte) ([]byte, error) {
 		openErr = errors.New("no vault key is available")
 	}
 	return nil, openErr
+}
+
+// Fingerprint returns a stable, key-bound digest without exposing the vault key.
+func (s *Store) Fingerprint(data []byte) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key, _, err := s.keyForWrite()
+	if err != nil {
+		return "", err
+	}
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte("corv-connection-fingerprint-v1\x00"))
+	_, _ = mac.Write(data)
+	return hex.EncodeToString(mac.Sum(nil)), nil
 }
 
 func (s *Store) Set(ref string, secret Secret) error {

@@ -1,6 +1,7 @@
 package output
 
 import (
+	"bytes"
 	"fmt"
 	"regexp"
 	"strings"
@@ -11,6 +12,9 @@ import (
 // backspaces and stripping ANSI - and returns the full result without
 // bounding. Used to render a stored run log faithfully.
 func Clean(raw []byte) string {
+	if !utf8.Valid(raw) {
+		raw = bytes.ToValidUTF8(raw, []byte("\uFFFD"))
+	}
 	f := New(Options{Unbounded: true})
 	_, _ = f.Write(raw)
 	return f.String()
@@ -128,7 +132,23 @@ func cutTail(s string, n int) string {
 var signalRE = regexp.MustCompile(`(?i)\b(error|err|warn|warning|fatal|fail|failed|failure|exception|traceback|panic|denied|refused|unreachable|timed out|timeout|unable|cannot|can't|deprecat|critical|conflict)\b`)
 
 // falsePositiveRE drops reassuring lines like "0 errors" or "no warnings".
-var falsePositiveRE = regexp.MustCompile(`(?i)\b(no|0|zero|without|none)\b[^.]{0,20}\b(error|warning|failure|issue|conflict)s?\b`)
+var falsePositiveRE = regexp.MustCompile(`(?i)(?:\b(?:no|0|zero|without|none)\b[^.]{0,20}\b(?:errors?|warnings?|fail(?:ed|ures?)?|issues?|conflicts?)\b|\b(?:errors?|warnings?|fail(?:ed|ures?)?|issues?|conflicts?)\s*[:=]\s*0\b)`)
+
+var signalClauseRE = regexp.MustCompile(`(?i)\s*(?:[,;|]|\band\b)\s*`)
+
+var signalHeadingRE = regexp.MustCompile(`(?i)^(?:={3,}\s*(?:failed units|errors|warnings)\s*={3,}|-{3,}\s*(?:failed units|errors|warnings)\s*-{3,})$`)
+
+func actionableSignal(line string) bool {
+	if signalHeadingRE.MatchString(strings.TrimSpace(line)) {
+		return false
+	}
+	for _, clause := range signalClauseRE.Split(line, -1) {
+		if signalRE.MatchString(clause) && !falsePositiveRE.MatchString(clause) {
+			return true
+		}
+	}
+	return false
+}
 
 // Signals extracts notable lines (errors, warnings, failures) from clean
 // text, deduped and capped at max. These are surfaced regardless of exit
@@ -138,7 +158,7 @@ func Signals(text string, max int) []string {
 	var out []string
 	for _, l := range strings.Split(text, "\n") {
 		t := strings.TrimSpace(l)
-		if t == "" || !signalRE.MatchString(t) || falsePositiveRE.MatchString(t) {
+		if t == "" || !actionableSignal(t) {
 			continue
 		}
 		if seen[t] {

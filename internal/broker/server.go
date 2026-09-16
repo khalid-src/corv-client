@@ -2,9 +2,11 @@ package broker
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +40,7 @@ var controlOpTimeout = 30 * time.Second
 var fullLogTransferTimeout = 2 * time.Minute
 
 var errStartUncertain = errors.New("remote job start outcome is uncertain")
+var errRunKeyConflict = errors.New("run key was already used with different command or connection state")
 
 // entry is one held connection plus a lock that serializes (re)dialing for
 // that profile while allowing other profiles to proceed in parallel.
@@ -56,11 +59,12 @@ type entry struct {
 }
 
 type connectionSnapshot struct {
-	profile     profile.Profile
-	registry    profile.Registry
-	secret      vault.Secret
-	jumps       []sshconn.JumpHost
-	fingerprint string
+	profile           profile.Profile
+	registry          profile.Registry
+	secret            vault.Secret
+	jumps             []sshconn.JumpHost
+	fingerprint       string
+	legacyFingerprint string
 }
 
 // server holds the warm connections and serves IPC requests.
@@ -68,6 +72,7 @@ type server struct {
 	store   *profile.Store
 	secrets *vault.Store
 	audit   *audit.Log
+	now     func() time.Time
 
 	mu      sync.Mutex
 	entries map[string]*entry
@@ -94,11 +99,13 @@ func Serve() error {
 		store:    profile.NewStore(p.ConfigFile, secrets),
 		secrets:  secrets,
 		audit:    audit.NewLog(p.AuditFile),
+		now:      time.Now,
 		entries:  map[string]*entry{},
 		jobs:     jobs,
 		activity: make(chan struct{}, 1),
 	}
 	s.sweepLocalRuns()
+	s.pruneExpiredKeyedJobs(s.currentTime())
 
 	ln, addr, err := listenBroker()
 	if err != nil {
@@ -122,6 +129,9 @@ func Serve() error {
 		Token:   token,
 		PID:     os.Getpid(),
 		Version: version.Version,
+	}
+	if id, err := processStartID(ep.PID); err == nil {
+		ep.ProcessStart = id
 	}
 	if exe, err := os.Executable(); err == nil {
 		ep.ExePath = exe
@@ -197,6 +207,13 @@ func (s *server) handle(conn net.Conn, token string) bool {
 		writeResp(conn, s.exec(req))
 	case OpOutput:
 		writeResp(conn, s.output(req))
+	case OpJobs:
+		runs, err := s.listRuns()
+		if err != nil {
+			writeResp(conn, Response{OK: false, Error: err.Error()})
+		} else {
+			writeResp(conn, Response{OK: true, Runs: runs})
+		}
 	case OpClose:
 		s.closeOne(req.Name)
 		writeResp(conn, Response{OK: true})
@@ -220,12 +237,15 @@ func writeResp(conn net.Conn, resp Response) {
 // exec resolves the profile, attaches to an existing detached job when one
 // is running for the same command, or starts a new one.
 func (s *server) exec(req Request) Response {
+	if req.RunKey != "" && !validRunKey(req.RunKey) {
+		return Response{OK: false, Error: "run key must be 1-128 characters using letters, numbers, '.', '_', ':', or '-'", Kind: "bad_request"}
+	}
 	snapshot, ok, err := s.loadConnectionSnapshot(req.Name)
 	if err != nil {
 		return Response{OK: false, Error: err.Error(), Kind: "local_error"}
 	}
 	if !ok {
-		return Response{OK: false, Error: "unknown connection: " + req.Name}
+		return Response{OK: false, Error: "unknown connection: " + req.Name, Kind: "unknown_connection"}
 	}
 	p := snapshot.profile
 	reg := snapshot.registry
@@ -233,7 +253,16 @@ func (s *server) exec(req Request) Response {
 	e := s.entryFor(req.Name)
 	s.prepareEntry(e, snapshot)
 	command := sshconn.CommandString(req.Command)
-	j := s.jobFor(e, p.Name, command, fingerprint)
+	j, err := s.jobForRequest(e, p.Name, command, fingerprint, req.RunKey)
+	if err != nil {
+		return Response{OK: false, Error: err.Error(), Kind: "run_key_conflict"}
+	}
+	if req.RunKey != "" && j.expired() {
+		return expiredRunResponse(j.id)
+	}
+	if req.RunKey != "" && j.completed() {
+		return s.output(Request{RunID: j.id})
+	}
 	if err := s.ensureJobStarted(e, p, reg, j); err != nil {
 		if errors.Is(err, errStartUncertain) {
 			return Response{
@@ -254,8 +283,16 @@ func (s *server) exec(req Request) Response {
 	}
 
 	resp, saved := s.watchJob(e, p, reg, j, parseWait(req.Wait, waitWindow()))
+	if req.RunKey != "" && j.expired() {
+		s.releaseJob(e, j)
+		return resp
+	}
 	if !resp.Running && (saved || j.failed()) {
-		s.removeJob(e, p.Name, command, j)
+		if req.RunKey != "" && saved && !j.failed() {
+			s.releaseJob(e, j)
+		} else {
+			s.removeJob(e, p.Name, command, j)
+		}
 	}
 	return resp
 }
@@ -279,7 +316,7 @@ func (s *server) connFor(e *entry, fingerprint string) (*sshconn.Conn, error) {
 			e.mu.Unlock()
 			if shouldSweep {
 				ctx, cancel := context.WithTimeout(context.Background(), controlOpTimeout)
-				_ = conn.ExecRaw(ctx, sweepRemoteCommand(), maxDeltaBytes)
+				_ = conn.ExecRaw(ctx, sweepRemoteCommand(s.currentTime()), maxDeltaBytes)
 				cancel()
 			}
 			return conn, nil
@@ -319,7 +356,7 @@ func (s *server) connFor(e *entry, fingerprint string) (*sshconn.Conn, error) {
 
 		if shouldSweep {
 			ctx, cancel := context.WithTimeout(context.Background(), controlOpTimeout)
-			_ = conn.ExecRaw(ctx, sweepRemoteCommand(), maxDeltaBytes)
+			_ = conn.ExecRaw(ctx, sweepRemoteCommand(s.currentTime()), maxDeltaBytes)
 			cancel()
 		}
 		return conn, nil
@@ -428,31 +465,84 @@ func (s *server) entryFor(name string) *entry {
 }
 
 func (s *server) jobFor(e *entry, profileName, command, fingerprint string) *job {
+	j, _ := s.jobForRequest(e, profileName, command, fingerprint, "")
+	return j
+}
+
+func (s *server) jobForRequest(e *entry, profileName, command, fingerprint, runKey string) (*job, error) {
 	key := jobKey(profileName, command)
+	commandHash := ""
+	runKeyHash := ""
+	if runKey != "" {
+		s.pruneExpiredKeyedJobs(s.currentTime())
+		key = keyedJobKey(profileName, runKey)
+		commandHash = valueHash(command)
+		runKeyHash = valueHash(runKey)
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.jobs == nil {
 		e.jobs = map[string]*job{}
 	}
-	if j, ok := e.jobs[key]; ok && j.fingerprint == fingerprint {
-		if !j.finished() || j.finalizePending() {
-			return j
+	if j, ok := e.jobs[key]; ok {
+		if runKey != "" && (j.commandHash != commandHash || j.runKeyHash != runKeyHash || j.fingerprint != fingerprint) {
+			return nil, errRunKeyConflict
+		}
+		if j.fingerprint != fingerprint {
+			delete(e.jobs, key)
+		} else if !j.finished() || j.finalizePending() || runKey != "" {
+			return j, nil
 		}
 	}
-	if rec, ok := s.persistedJob(profileName, command); ok &&
-		(rec.Fingerprint == "" || rec.Fingerprint == fingerprint) &&
-		(rec.Status == jobStatusStarting || rec.Status == jobStatusRunning || rec.Status == jobStatusFinalizePending) {
-		j := recordToJob(rec)
-		j.key = key
-		j.command = command
-		j.fingerprint = fingerprint
-		e.jobs[key] = j
-		return j
+	if rec, ok := s.persistedJobByKey(key); ok {
+		if runKey != "" && (rec.CommandHash != commandHash || rec.RunKeyHash != runKeyHash || rec.Fingerprint != fingerprint) {
+			return nil, errRunKeyConflict
+		}
+		needsFinalization := rec.Status == jobStatusDone && !retainedRunLogExists(rec.RunID)
+		if (rec.Fingerprint == "" || rec.Fingerprint == fingerprint) &&
+			(rec.Status == jobStatusStarting || rec.Status == jobStatusRunning || rec.Status == jobStatusFinalizePending ||
+				needsFinalization || (runKey != "" && (rec.Status == jobStatusDone || rec.Status == jobStatusExpired))) {
+			j := recordToJob(rec)
+			if needsFinalization {
+				j.status = jobStatusFinalizePending
+			}
+			j.key = key
+			j.command = command
+			j.commandHash = commandHash
+			j.runKeyHash = runKeyHash
+			j.fingerprint = fingerprint
+			e.jobs[key] = j
+			return j, nil
+		}
 	}
 	j := newJob(command, fingerprint)
 	j.key = key
+	j.commandHash = commandHash
+	j.runKeyHash = runKeyHash
 	e.jobs[key] = j
-	return j
+	return j, nil
+}
+
+func (s *server) releaseJob(e *entry, j *job) {
+	e.mu.Lock()
+	if e.jobs[j.key] == j {
+		delete(e.jobs, j.key)
+	}
+	e.mu.Unlock()
+}
+
+func (s *server) expireJob(e *entry, profileName string, j *job) error {
+	j.mu.Lock()
+	j.done = true
+	j.status = jobStatusExpired
+	j.finishedAt = time.Time{}
+	j.durationMS = 0
+	j.mu.Unlock()
+	if err := s.savePersistedJob(profileName, j); err != nil {
+		return err
+	}
+	s.releaseJob(e, j)
+	return nil
 }
 
 func (s *server) removeJob(e *entry, profileName, key string, j *job) {
@@ -568,7 +658,7 @@ func (s *server) prepareEntry(e *entry, snapshot connectionSnapshot) {
 	if conn != nil {
 		_ = conn.Close()
 	}
-	if err := s.deletePersistedJobs(profileName); err != nil {
+	if err := s.deleteUnkeyedPersistedJobs(profileName); err != nil {
 		brokerLog.Printf("delete stale jobs for profile %s: %v", profileName, err)
 	}
 }
@@ -589,6 +679,11 @@ func (s *server) loadConnectionSnapshot(name string) (connectionSnapshot, bool, 
 		snapshot, err = s.connectionSnapshotFor(p, reg)
 		return err
 	})
+	if err == nil && found {
+		if err := s.migrateLegacyFingerprints(name, snapshot.fingerprint, snapshot.legacyFingerprint); err != nil {
+			return connectionSnapshot{}, false, fmt.Errorf("migrate saved run identity: %w", err)
+		}
+	}
 	return snapshot, found, err
 }
 
@@ -599,9 +694,10 @@ func (s *server) connectionSnapshotFor(p profile.Profile, reg profile.Registry) 
 		if err != nil {
 			return connectionSnapshot{}, fmt.Errorf("read stored credentials for %q: %w", p.Name, err)
 		}
-		if ok {
-			secret = stored
+		if !ok {
+			return connectionSnapshot{}, fmt.Errorf("stored credentials for %q were not found", p.Name)
 		}
+		secret = stored
 	}
 	jumps, err := sshconn.ParseJumpChain(p.ProxyJump)
 	if err != nil {
@@ -611,19 +707,44 @@ func (s *server) connectionSnapshotFor(p profile.Profile, reg profile.Registry) 
 		return connectionSnapshot{}, err
 	}
 
-	credentials := sha256.Sum256([]byte(secret.Password + "\x00" + secret.Passphrase))
-	sum := sha256.New()
+	legacyCredentials := sha256.Sum256([]byte(secret.Password + "\x00" + secret.Passphrase))
+	legacy := sha256.New()
+	var current bytes.Buffer
+	writeFingerprintField := func(value string) {
+		_ = binary.Write(&current, binary.BigEndian, uint64(len(value)))
+		_, _ = current.WriteString(value)
+	}
 	for _, field := range []string{
 		p.Target,
 		strconv.Itoa(p.Port),
 		p.IdentityFile,
 		p.ProxyJump,
-		fmt.Sprintf("%x", credentials),
+		secret.Password,
+		secret.Passphrase,
 	} {
-		_, _ = sum.Write([]byte(field))
-		_, _ = sum.Write([]byte{0})
+		writeFingerprintField(field)
+	}
+	for _, field := range []string{
+		p.Target,
+		strconv.Itoa(p.Port),
+		p.IdentityFile,
+		p.ProxyJump,
+		fmt.Sprintf("%x", legacyCredentials),
+	} {
+		_, _ = legacy.Write([]byte(field))
+		_, _ = legacy.Write([]byte{0})
 	}
 	for _, jump := range jumps {
+		for _, field := range []string{
+			jump.User,
+			jump.Host,
+			strconv.Itoa(jump.Port),
+			jump.IdentityFile,
+			jump.Password,
+			jump.Passphrase,
+		} {
+			writeFingerprintField(field)
+		}
 		jumpCredentials := sha256.Sum256([]byte(jump.Password + "\x00" + jump.Passphrase))
 		for _, field := range []string{
 			jump.User,
@@ -632,16 +753,21 @@ func (s *server) connectionSnapshotFor(p profile.Profile, reg profile.Registry) 
 			jump.IdentityFile,
 			fmt.Sprintf("%x", jumpCredentials),
 		} {
-			_, _ = sum.Write([]byte(field))
-			_, _ = sum.Write([]byte{0})
+			_, _ = legacy.Write([]byte(field))
+			_, _ = legacy.Write([]byte{0})
 		}
 	}
+	fingerprint, err := s.secrets.Fingerprint(current.Bytes())
+	if err != nil {
+		return connectionSnapshot{}, fmt.Errorf("fingerprint connection state: %w", err)
+	}
 	return connectionSnapshot{
-		profile:     p,
-		registry:    reg,
-		secret:      secret,
-		jumps:       jumps,
-		fingerprint: fmt.Sprintf("%x", sum.Sum(nil)),
+		profile:           p,
+		registry:          reg,
+		secret:            secret,
+		jumps:             jumps,
+		fingerprint:       fingerprint,
+		legacyFingerprint: fmt.Sprintf("%x", legacy.Sum(nil)),
 	}, nil
 }
 
@@ -691,77 +817,9 @@ func (s *server) hasRunningJobs() bool {
 	return false
 }
 
-func (s *server) persistedJob(profileName, command string) (jobRecord, bool) {
-	s.jobsMu.Lock()
-	defer s.jobsMu.Unlock()
-	rec, ok := s.jobs.Jobs[jobKey(profileName, command)]
-	return rec, ok
-}
-
-func (s *server) persistedJobByRunID(runID string) (jobRecord, bool) {
-	s.jobsMu.Lock()
-	defer s.jobsMu.Unlock()
-	for _, rec := range s.jobs.Jobs {
-		if rec.RunID == runID {
-			return rec, true
-		}
+func (s *server) currentTime() time.Time {
+	if s != nil && s.now != nil {
+		return s.now()
 	}
-	return jobRecord{}, false
-}
-
-func (s *server) savePersistedJob(profileName string, j *job) error {
-	if !s.currentJob(profileName, j) {
-		return nil
-	}
-	j.mu.Lock()
-	rec := newJobRecord(profileName, j)
-	if j.done {
-		rec.ExitCode = j.exitCode
-	}
-	j.mu.Unlock()
-
-	s.jobsMu.Lock()
-	if s.jobs.Jobs == nil {
-		s.jobs.Jobs = map[string]jobRecord{}
-	}
-	s.jobs.Jobs[rec.Key] = rec
-	err := saveJobRegistry(s.jobs)
-	s.jobsMu.Unlock()
-	return err
-}
-
-func (s *server) currentJob(profileName string, j *job) bool {
-	s.mu.Lock()
-	e, ok := s.entries[profileName]
-	s.mu.Unlock()
-	if !ok {
-		return false
-	}
-	e.mu.Lock()
-	key := j.key
-	if key == "" {
-		key = jobKey(profileName, j.command)
-	}
-	current := e.jobs[key] == j && e.fingerprint == j.fingerprint
-	e.mu.Unlock()
-	return current
-}
-
-func (s *server) deletePersistedJobByKey(key string) {
-	s.jobsMu.Lock()
-	delete(s.jobs.Jobs, key)
-	_ = saveJobRegistry(s.jobs)
-	s.jobsMu.Unlock()
-}
-
-func (s *server) deletePersistedJobs(profileName string) error {
-	s.jobsMu.Lock()
-	for key, rec := range s.jobs.Jobs {
-		if rec.Profile == profileName {
-			delete(s.jobs.Jobs, key)
-		}
-	}
-	err := saveJobRegistry(s.jobs)
-	s.jobsMu.Unlock()
-	return err
+	return time.Now()
 }

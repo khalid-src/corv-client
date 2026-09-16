@@ -2,6 +2,6 @@
 
 package vault
 
-func (s *Store) osKey() ([]byte, bool) {
-	return nil, false
+func (s *Store) osKey() ([]byte, bool, error) {
+	return nil, false, nil
 }

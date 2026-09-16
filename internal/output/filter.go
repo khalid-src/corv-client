@@ -245,7 +245,7 @@ func (f *Filter) scanSignal(line string) {
 		return
 	}
 	t := strings.TrimSpace(line)
-	if t == "" || !signalRE.MatchString(t) || falsePositiveRE.MatchString(t) {
+	if t == "" || !actionableSignal(t) {
 		return
 	}
 	if f.signalsSeen == nil {

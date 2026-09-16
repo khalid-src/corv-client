@@ -27,6 +27,91 @@ func TestDialSurfacesVaultReadError(t *testing.T) {
 	}
 }
 
+func TestConnectionSnapshotRejectsMissingStoredCredentials(t *testing.T) {
+	dir := t.TempDir()
+	s := &server{secrets: vault.New(filepath.Join(dir, "vault.json"), filepath.Join(dir, "vault.key"))}
+	p := profile.Profile{Name: "srv1", Target: "example.com", SecretRef: "profile:srv1:missing"}
+
+	_, err := s.connectionSnapshotFor(p, profile.Registry{})
+	if err == nil || !strings.Contains(err.Error(), "stored credentials") || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestConnectionFingerprintDoesNotPersistCredentialVerifier(t *testing.T) {
+	dir := t.TempDir()
+	secrets := vault.New(filepath.Join(dir, "vault.json"), filepath.Join(dir, "vault.key"))
+	const ref = "profile:srv1:opaque"
+	if err := secrets.Set(ref, vault.Secret{Password: "first-password", Passphrase: "first-passphrase"}); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{secrets: secrets}
+	p := profile.Profile{Name: "srv1", Target: "user@example.com", SecretRef: ref}
+	first, err := s.connectionSnapshotFor(p, profile.Registry{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := secrets.Set(ref, vault.Secret{Password: "second-password", Passphrase: "second-passphrase"}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.connectionSnapshotFor(p, profile.Registry{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.fingerprint == second.fingerprint {
+		t.Fatal("connection identity did not change when credential bytes changed")
+	}
+	if first.legacyFingerprint == second.legacyFingerprint {
+		t.Fatal("legacy credential-derived fingerprint did not change")
+	}
+	if first.fingerprint == first.legacyFingerprint || second.fingerprint == second.legacyFingerprint {
+		t.Fatal("current connection identity retained the legacy credential verifier")
+	}
+}
+
+func TestLoadConnectionSnapshotMigratesLegacyFingerprint(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CORV_HOME", dir)
+	secrets := vault.New(filepath.Join(dir, "vault.json"), filepath.Join(dir, "vault.key"))
+	const ref = "profile:srv1:opaque"
+	if err := secrets.Set(ref, vault.Secret{Password: "secret"}); err != nil {
+		t.Fatal(err)
+	}
+	store := profile.NewStore(filepath.Join(dir, "config.json"), secrets)
+	reg := profile.Registry{}
+	p := profile.Profile{Name: "srv1", Target: "user@example.com", SecretRef: ref}
+	if err := reg.Set(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(reg); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{store: store, secrets: secrets, jobs: jobRegistry{Jobs: map[string]jobRecord{}}}
+	snapshot, err := s.connectionSnapshotFor(p, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := jobKey("srv1", "true")
+	s.jobs.Jobs[key] = jobRecord{Key: key, RunID: "0000000000000000-aa", Profile: "srv1", Fingerprint: snapshot.legacyFingerprint, Status: jobStatusRunning}
+	if err := saveJobRegistry(s.jobs); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.loadConnectionSnapshot("srv1"); err != nil || !ok {
+		t.Fatalf("load snapshot: present=%v err=%v", ok, err)
+	}
+	rec := s.jobs.Jobs[key]
+	if rec.Fingerprint != snapshot.fingerprint || rec.FingerprintVersion != connectionFingerprintVersion {
+		t.Fatalf("migrated record = %#v", rec)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "runs", "jobs.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), snapshot.legacyFingerprint) {
+		t.Fatal("jobs.json retained the credential-derived fingerprint")
+	}
+}
+
 func TestConnectionSnapshotDoesNotMixProfileAndCredentialVersions(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CORV_HOME", dir)
@@ -116,6 +201,20 @@ func TestExecClassifiesVaultReadErrorAsLocal(t *testing.T) {
 	s := &server{store: store, secrets: secrets}
 	resp := s.exec(Request{Name: "srv1", Command: []string{"true"}})
 	if resp.OK || resp.Kind != "local_error" || !strings.Contains(resp.Error, "credentials") || strings.Contains(resp.Error, "authentication") {
+		t.Fatalf("response = %#v", resp)
+	}
+}
+
+func TestExecClassifiesProfileRemovedBeforeBrokerLookup(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CORV_HOME", dir)
+	secrets := vault.New(filepath.Join(dir, "vault.json"), filepath.Join(dir, "vault.key"))
+	s := &server{
+		store:   profile.NewStore(filepath.Join(dir, "config.json"), secrets),
+		secrets: secrets,
+	}
+	resp := s.exec(Request{Name: "removed", Command: []string{"true"}})
+	if resp.OK || resp.Kind != "unknown_connection" {
 		t.Fatalf("response = %#v", resp)
 	}
 }

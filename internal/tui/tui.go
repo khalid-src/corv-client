@@ -437,7 +437,7 @@ func homeHeader() []string {
 		"",
 		accentBold.Render(raven[0]),
 		accentBold.Render(raven[1]) + gap + accentBold.Render("CORV"),
-		accentBold.Render(raven[2]) + gap + subtleStyle.Render("The SSH client for AI agents and humans"),
+		accentBold.Render(raven[2]) + gap + subtleStyle.Render("The SSH execution layer for AI agents and humans"),
 		accentBold.Render(raven[3]),
 		"",
 	}
@@ -595,7 +595,7 @@ func (m model) viewInfo() string {
 	disclaimer := "Software is provided as-is. Use responsibly."
 	w := min(84, max(40, m.width-10))
 	body := titleStyle.Render("Corv") + "\n\n" +
-		subtleStyle.Render("The SSH client for AI agents and humans") + "\n\n" +
+		subtleStyle.Render("The SSH execution layer for AI agents and humans") + "\n\n" +
 		"Version: " + focusLabel.Render(version.Version) + "\n" +
 		"License: " + focusLabel.Render("Apache-2.0") + "\n" +
 		"Maintainer: " + focusLabel.Render("khalid-src") + "\n" +

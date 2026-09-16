@@ -8,9 +8,8 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/khalid-src/corv-client/internal/importstate"
 	"github.com/khalid-src/corv-client/internal/profile"
-	"github.com/khalid-src/corv-client/internal/statelock"
-	"github.com/khalid-src/corv-client/internal/vault"
 )
 
 type importModel struct {
@@ -68,47 +67,11 @@ func (m model) doImport(path string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	added := 0
-	err = statelock.WithLock(func() error {
-		reg, err := m.store.Load()
-		if err != nil {
-			return err
-		}
-		for _, im := range imported {
-			p := im.Profile
-			if _, exists := reg.Get(p.Name); exists {
-				continue
-			}
-			if p.IdentityFile == "" && im.KeyMaterial != "" {
-				keyPath, err := profile.WriteIdentityFile(p.Name, im.KeyMaterial)
-				if err != nil {
-					continue
-				}
-				p.IdentityFile = keyPath
-			}
-			// Validate before touching the vault so a bad profile never leaves an
-			// orphaned secret behind.
-			if err := validateProfile(p); err != nil {
-				continue
-			}
-			if im.Password != "" || im.Passphrase != "" {
-				ref := "profile:" + p.Name
-				if err := m.secrets.Set(ref, vault.Secret{Password: im.Password, Passphrase: im.Passphrase}); err != nil {
-					return err
-				}
-				p.SecretRef = ref
-			}
-			if err := reg.Set(p); err != nil {
-				return err
-			}
-			added++
-		}
-		return m.store.Save(reg)
-	})
+	result, err := importstate.Apply(m.store, m.secrets, imported)
 	if err != nil {
-		return added, err
+		return result.Added, err
 	}
-	return added, nil
+	return result.Added, nil
 }
 
 func (m model) viewImport() string {
