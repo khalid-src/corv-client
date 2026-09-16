@@ -83,12 +83,6 @@ corv uninstall   # remove corv; add --purge to also delete saved connections
 `corv update` only runs when you run it - Corv never updates itself in the
 background.
 
-## Usage
-
-<p align="center">
-  <img src="assets/presentation.png" alt="Corv - an AI agent and a human both driving the same connection" width="720">
-</p>
-
 Manage connections interactively:
 
 ```bash
