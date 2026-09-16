@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,14 +16,38 @@ import (
 	"github.com/khalid-src/corv-client/internal/broker"
 	"github.com/khalid-src/corv-client/internal/paths"
 	"github.com/khalid-src/corv-client/internal/profile"
+	"github.com/khalid-src/corv-client/internal/vault"
 )
+
+type inaccessibleSealer struct{}
+
+func (inaccessibleSealer) Seal(data []byte) ([]byte, error) { return data, nil }
+func (inaccessibleSealer) Open([]byte) ([]byte, error) {
+	return nil, fmt.Errorf("%w: underlying OS failure", vault.ErrKeyAccess)
+}
 
 type failingCommandBroker struct {
 	err error
 }
 
+type responseCommandBroker struct {
+	resp broker.Response
+}
+
 func (b failingCommandBroker) Exec(string, []string) (broker.Response, error) {
 	return broker.Response{}, b.err
+}
+
+func (b failingCommandBroker) ExecKeyed(string, []string, string) (broker.Response, error) {
+	return broker.Response{}, b.err
+}
+
+func (b responseCommandBroker) Exec(string, []string) (broker.Response, error) {
+	return b.resp, nil
+}
+
+func (b responseCommandBroker) ExecKeyed(string, []string, string) (broker.Response, error) {
+	return b.resp, nil
 }
 
 func withHome(t *testing.T) {
@@ -175,6 +200,33 @@ func TestParseOutputArgsJSON(t *testing.T) {
 	}
 }
 
+func TestOutputJSONLocalFailuresHaveErrorKinds(t *testing.T) {
+	tests := []struct {
+		name string
+		resp broker.Response
+		kind string
+	}{
+		{name: "bad request", resp: broker.Response{Error: "bad arguments", Kind: "bad_request"}, kind: "bad_request"},
+		{name: "local state", resp: broker.Response{Error: "read metadata", Kind: "local_error"}, kind: "local_error"},
+		{name: "broker", resp: broker.Response{Error: "broker unavailable", Kind: "disconnected"}, kind: "disconnected"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			if code := writeOutputJSON(&out, tt.resp); code != 1 {
+				t.Fatalf("exit = %d, want 1", code)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+				t.Fatal(err)
+			}
+			if got["error_kind"] != tt.kind {
+				t.Fatalf("json = %#v", got)
+			}
+		})
+	}
+}
+
 func TestOutputJSONUsesPersistedFields(t *testing.T) {
 	var out bytes.Buffer
 	code := writeOutputJSON(&out, broker.Response{
@@ -198,10 +250,27 @@ func TestOutputJSONUsesPersistedFields(t *testing.T) {
 	if got["exit_code"] != float64(0) || got["running"] != false {
 		t.Fatalf("unexpected state json: %#v", got)
 	}
+	if got["error_kind"] != "" {
+		t.Fatalf("unexpected error kind: %#v", got)
+	}
 	for _, fabricated := range []string{"connection", "started_at"} {
 		if _, ok := got[fabricated]; ok {
 			t.Fatalf("output json fabricated %q: %#v", fabricated, got)
 		}
+	}
+}
+
+func TestOutputJSONReportsLossyText(t *testing.T) {
+	var out bytes.Buffer
+	if code := writeOutputJSON(&out, broker.Response{OK: true, RunID: "run-123", Lossy: true}); code != 0 {
+		t.Fatalf("exit = %d", code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["lossy"] != true {
+		t.Fatalf("json = %#v", got)
 	}
 }
 
@@ -341,6 +410,52 @@ func TestLogClearRejectsName(t *testing.T) {
 	}
 }
 
+func TestLogSurfacesRunIDAndStructuredHistory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	log := audit.NewLog(path)
+	entry := audit.Entry{
+		StartedAt: time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC),
+		Profile:   "srv1",
+		Command:   "deploy",
+		ExitCode:  75,
+		RunID:     "0000000000000000-aa",
+	}
+	if err := log.Append(entry); err != nil {
+		t.Fatal(err)
+	}
+	d := deps{log: log}
+	var out, errOut bytes.Buffer
+	if code := cmdLog(d, nil, &out, &errOut); code != 0 {
+		t.Fatalf("plain log exit = %d stderr=%q", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "deploy\trun=0000000000000000-aa") {
+		t.Fatalf("plain log omitted run id: %q", out.String())
+	}
+
+	out.Reset()
+	if code := cmdLog(d, []string{"--json"}, &out, &errOut); code != 0 {
+		t.Fatalf("json log exit = %d stderr=%q", code, errOut.String())
+	}
+	var got []audit.Entry
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("invalid log JSON: %v\n%s", err, out.String())
+	}
+	if len(got) != 1 || got[0].RunID != entry.RunID || got[0].ExitCode != 75 {
+		t.Fatalf("log JSON = %#v", got)
+	}
+}
+
+func TestLogJSONKeepsArgumentErrorsStructured(t *testing.T) {
+	d := deps{log: audit.NewLog(filepath.Join(t.TempDir(), "audit.jsonl"))}
+	var out, errOut bytes.Buffer
+	if code := cmdLog(d, []string{"--json", "--tail"}, &out, &errOut); code != 1 {
+		t.Fatalf("exit code = %d", code)
+	}
+	if errOut.Len() != 0 || !strings.Contains(out.String(), `"error_kind":"bad_request"`) {
+		t.Fatalf("stdout=%q stderr=%q", out.String(), errOut.String())
+	}
+}
+
 func TestDoctorWithoutBrokerIsClean(t *testing.T) {
 	withHome(t)
 	code, out, errOut := runCLI("doctor")
@@ -356,6 +471,135 @@ func TestDoctorWithoutBrokerIsClean(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(p.Root, "broker.json")); !os.IsNotExist(err) {
 		t.Fatalf("doctor started or published a broker: %v", err)
+	}
+}
+
+func TestDoctorSurfacesBrokerInspectionFailure(t *testing.T) {
+	withHome(t)
+	original := newDoctorClient
+	newDoctorClient = func(string) statusClient {
+		return fakeStatusClient{err: errors.New("private endpoint detail")}
+	}
+	t.Cleanup(func() { newDoctorClient = original })
+
+	code, out, errOut := runCLI("doctor")
+	if code != 1 || errOut != "" {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, out, errOut)
+	}
+	if !strings.Contains(out, "broker:           unavailable") || strings.Contains(out, "private endpoint detail") {
+		t.Fatalf("doctor output = %q", out)
+	}
+
+	code, out, errOut = runCLI("doctor", "--full")
+	if code != 1 || errOut != "" || !strings.Contains(out, "private endpoint detail") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, out, errOut)
+	}
+}
+
+func TestDoctorDistinguishesInaccessiblePathFromMissing(t *testing.T) {
+	label, ok := presentLabel("\x00", false)
+	if ok || !strings.Contains(label, "unavailable") || strings.Contains(label, "invalid") {
+		t.Fatalf("label=%q ok=%v", label, ok)
+	}
+}
+
+func TestExecReportsAuditWriteFailureWithoutChangingOutcome(t *testing.T) {
+	originalExecutable := executablePath
+	originalBroker := newCommandBroker
+	executablePath = func() (string, error) { return "corv", nil }
+	newCommandBroker = func(string) commandBroker {
+		return responseCommandBroker{resp: broker.Response{OK: true, Stdout: "done\n"}}
+	}
+	t.Cleanup(func() {
+		executablePath = originalExecutable
+		newCommandBroker = originalBroker
+	})
+
+	var stdout, stderr bytes.Buffer
+	d := deps{log: audit.NewLog(t.TempDir())}
+	code := execCommand(d, profile.Profile{Name: "srv1"}, []string{"true"}, true, &stdout, &stderr)
+	if code != 0 || stderr.Len() != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	highlights, ok := got["highlights"].([]any)
+	if !ok || len(highlights) != 1 || highlights[0] != "local command history could not be written" {
+		t.Fatalf("json = %#v", got)
+	}
+}
+
+func TestExecFinalizationFailureReturnsToolError(t *testing.T) {
+	originalExecutable := executablePath
+	originalBroker := newCommandBroker
+	executablePath = func() (string, error) { return "corv", nil }
+	newCommandBroker = func(string) commandBroker {
+		return responseCommandBroker{resp: broker.Response{
+			OK:       false,
+			ExitCode: 1,
+			Error:    "run finished, but Corv could not save its log locally; remote copy retained",
+			Kind:     "local_error",
+			RunID:    "run-123",
+		}}
+	}
+	t.Cleanup(func() {
+		executablePath = originalExecutable
+		newCommandBroker = originalBroker
+	})
+
+	var stdout, stderr bytes.Buffer
+	d := deps{log: audit.NewLog(filepath.Join(t.TempDir(), "audit.jsonl"))}
+	code := execCommand(d, profile.Profile{Name: "srv1"}, []string{"true"}, true, &stdout, &stderr)
+	if code != 1 || stderr.Len() != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["ok"] != false || got["exit_code"] != float64(1) || got["error_kind"] != "local_error" {
+		t.Fatalf("json = %#v", got)
+	}
+}
+
+func TestDoctorExplainsVaultAccessContextWithoutLeakingRawError(t *testing.T) {
+	withHome(t)
+	p, err := paths.Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(p.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p.ConfigFile, []byte("encrypted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d := deps{
+		store:   profile.NewStore(p.ConfigFile, inaccessibleSealer{}),
+		secrets: vault.New(p.VaultFile, p.VaultKey),
+		log:     audit.NewLog(p.AuditFile),
+		paths:   p,
+	}
+	var out, errOut bytes.Buffer
+	if code := cmdDoctor(d, nil, &out, &errOut); code != 1 {
+		t.Fatalf("doctor exit = %d, stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+	if !strings.Contains(out.String(), "vault:            unreadable") ||
+		!strings.Contains(out.String(), "process context") {
+		t.Fatalf("doctor output = %q", out.String())
+	}
+	if strings.Contains(out.String(), "underlying OS failure") {
+		t.Fatalf("default doctor leaked raw error: %q", out.String())
+	}
+
+	out.Reset()
+	if code := cmdDoctor(d, []string{"--full"}, &out, &errOut); code != 1 {
+		t.Fatalf("full doctor exit = %d", code)
+	}
+	if !strings.Contains(out.String(), "underlying OS failure") {
+		t.Fatalf("full doctor omitted raw cause: %q", out.String())
 	}
 }
 
@@ -437,8 +681,27 @@ func TestParseExecRejectsCombinedInputModes(t *testing.T) {
 		{"--stdin-base64", "--", "true"},
 	}
 	for _, args := range cases {
-		if _, _, _, err := parseExec(args); err == nil {
+		if _, _, _, _, err := parseExec(args); err == nil {
 			t.Fatalf("parseExec(%v) accepted combined input modes", args)
+		}
+	}
+}
+
+func TestParseExecRunKey(t *testing.T) {
+	command, asJSON, input, runKey, err := parseExec([]string{"--json", "--run-key", "change-42", "--", "deploy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !asJSON || input != execInputArgs || runKey != "change-42" || len(command) != 1 || command[0] != "deploy" {
+		t.Fatalf("parse result: command=%v json=%v input=%v runKey=%q", command, asJSON, input, runKey)
+	}
+	for _, args := range [][]string{
+		{"--run-key"},
+		{"--run-key", "bad key", "--", "true"},
+		{"--run-key", "one", "--run-key", "two", "--", "true"},
+	} {
+		if _, _, _, _, err := parseExec(args); err == nil {
+			t.Fatalf("parseExec(%v) accepted invalid run key", args)
 		}
 	}
 }

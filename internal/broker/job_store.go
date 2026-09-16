@@ -14,20 +14,25 @@ import (
 var writeJobFile = atomicfile.Write
 
 type jobRecord struct {
-	Key         string `json:"key"`
-	RunID       string `json:"run_id"`
-	Profile     string `json:"profile"`
-	Command     string `json:"command,omitempty"`
-	Fingerprint string `json:"fingerprint"`
-	RemoteDir   string `json:"remote_dir"`
-	LogPath     string `json:"log_path"`
-	RCPath      string `json:"rc_path"`
-	Offset      int64  `json:"offset"`
-	StartedAt   int64  `json:"started_at"`
-	FinishedAt  int64  `json:"finished_at,omitempty"`
-	Status      string `json:"status"`
-	ExitCode    int    `json:"exit_code"`
-	PID         string `json:"pid,omitempty"`
+	Key                string `json:"key"`
+	RunID              string `json:"run_id"`
+	Profile            string `json:"profile"`
+	Command            string `json:"command,omitempty"`
+	CommandHash        string `json:"command_hash,omitempty"`
+	RunKeyHash         string `json:"run_key_hash,omitempty"`
+	Fingerprint        string `json:"fingerprint"`
+	FingerprintVersion int    `json:"fingerprint_version,omitempty"`
+	RemoteDir          string `json:"remote_dir"`
+	LogPath            string `json:"log_path"`
+	RCPath             string `json:"rc_path"`
+	Offset             int64  `json:"offset"`
+	StartedAt          int64  `json:"started_at"`
+	LastSeenAt         int64  `json:"last_seen_at,omitempty"`
+	FinishedAt         int64  `json:"finished_at,omitempty"`
+	DurationMS         int64  `json:"duration_ms,omitempty"`
+	Status             string `json:"status"`
+	ExitCode           int    `json:"exit_code"`
+	PID                string `json:"pid,omitempty"`
 }
 
 type jobRegistry struct {
@@ -36,6 +41,16 @@ type jobRegistry struct {
 
 func jobKey(profile, command string) string {
 	sum := sha256.Sum256([]byte(profile + "\x00" + command))
+	return hex.EncodeToString(sum[:])
+}
+
+func keyedJobKey(profile, runKey string) string {
+	sum := sha256.Sum256([]byte(profile + "\x00run-key\x00" + runKey))
+	return hex.EncodeToString(sum[:])
+}
+
+func valueHash(value string) string {
+	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -93,19 +108,28 @@ func newJobRecord(profile string, j *job) jobRecord {
 	if !j.finishedAt.IsZero() {
 		finishedAt = j.finishedAt.UnixNano()
 	}
+	var lastSeenAt int64
+	if !j.lastSeenAt.IsZero() {
+		lastSeenAt = j.lastSeenAt.UnixNano()
+	}
 	return jobRecord{
-		Key:         key,
-		RunID:       j.id,
-		Profile:     profile,
-		Fingerprint: j.fingerprint,
-		RemoteDir:   remoteJobDir,
-		LogPath:     remoteLogPath(j.id),
-		RCPath:      remoteRCPath(j.id),
-		Offset:      j.offset,
-		StartedAt:   j.startedAt.Unix(),
-		FinishedAt:  finishedAt,
-		Status:      j.status,
-		ExitCode:    0,
+		Key:                key,
+		RunID:              j.id,
+		Profile:            profile,
+		CommandHash:        j.commandHash,
+		RunKeyHash:         j.runKeyHash,
+		Fingerprint:        j.fingerprint,
+		FingerprintVersion: j.fingerprintVersion,
+		RemoteDir:          remoteJobDir,
+		LogPath:            remoteLogPath(j.id),
+		RCPath:             remoteRCPath(j.id),
+		Offset:             j.offset,
+		StartedAt:          j.startedAt.Unix(),
+		LastSeenAt:         lastSeenAt,
+		FinishedAt:         finishedAt,
+		DurationMS:         j.durationMS,
+		Status:             j.status,
+		ExitCode:           j.exitCode,
 	}
 }
 
@@ -118,17 +142,26 @@ func recordToJob(rec jobRecord) *job {
 	if rec.FinishedAt != 0 {
 		finishedAt = time.Unix(0, rec.FinishedAt)
 	}
+	var lastSeenAt time.Time
+	if rec.LastSeenAt != 0 {
+		lastSeenAt = time.Unix(0, rec.LastSeenAt)
+	}
 	return &job{
-		id:          rec.RunID,
-		key:         rec.Key,
-		command:     rec.Command,
-		fingerprint: rec.Fingerprint,
-		offset:      rec.Offset,
-		started:     true,
-		startedAt:   startedAt,
-		finishedAt:  finishedAt,
-		done:        rec.Status == jobStatusDone || rec.Status == jobStatusFinalizePending || rec.Status == jobStatusFailed,
-		exitCode:    rec.ExitCode,
-		status:      rec.Status,
+		id:                 rec.RunID,
+		key:                rec.Key,
+		command:            rec.Command,
+		commandHash:        rec.CommandHash,
+		runKeyHash:         rec.RunKeyHash,
+		fingerprint:        rec.Fingerprint,
+		fingerprintVersion: rec.FingerprintVersion,
+		offset:             rec.Offset,
+		started:            true,
+		startedAt:          startedAt,
+		lastSeenAt:         lastSeenAt,
+		finishedAt:         finishedAt,
+		durationMS:         rec.DurationMS,
+		done:               rec.Status == jobStatusDone || rec.Status == jobStatusFinalizePending || rec.Status == jobStatusFailed || rec.Status == jobStatusExpired,
+		exitCode:           rec.ExitCode,
+		status:             rec.Status,
 	}
 }

@@ -1,6 +1,9 @@
 package audit
 
 import (
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,6 +32,26 @@ func TestLogReadFiltersAndTails(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Command != "three" {
 		t.Fatalf("unexpected entries: %#v", got)
+	}
+}
+
+func TestLogReadTailUsesLatestMatchingEntries(t *testing.T) {
+	log := NewLog(filepath.Join(t.TempDir(), "audit.jsonl"))
+	for i := 0; i < 1000; i++ {
+		profile := "a"
+		if i%3 == 0 {
+			profile = "b"
+		}
+		if err := log.Append(Entry{StartedAt: time.Now(), Profile: profile, Command: fmt.Sprintf("command-%d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := log.Read("a", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].Command != "command-997" || entries[1].Command != "command-998" {
+		t.Fatalf("entries = %#v", entries)
 	}
 }
 
@@ -76,6 +99,23 @@ func TestLogReadSurvivesOversizedLine(t *testing.T) {
 	}
 }
 
+func TestLogReadTailSkipsOversizedLatestLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	good := `{"profile":"srv","command":"ok"}` + "\n"
+	huge := `{"profile":"srv","command":"` + strings.Repeat("x", 9<<20) + `"}` + "\n"
+	if err := os.WriteFile(path, []byte(good+huge), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := NewLog(path).Read("srv", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Command != "ok" {
+		t.Fatalf("entries = %#v", entries)
+	}
+}
+
 func TestCompleteAppendsDetachedRunOutcomeOnce(t *testing.T) {
 	log := NewLog(filepath.Join(t.TempDir(), "audit.jsonl"))
 	started := time.Now().UTC().Add(-time.Minute)
@@ -86,6 +126,7 @@ func TestCompleteAppendsDetachedRunOutcomeOnce(t *testing.T) {
 		Command:   "deploy",
 		ExitCode:  75,
 		RunID:     "run-123",
+		Status:    "running",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -107,3 +148,76 @@ func TestCompleteAppendsDetachedRunOutcomeOnce(t *testing.T) {
 		t.Fatalf("completion = %#v", got)
 	}
 }
+
+func TestCompleteDoesNotTreatRemoteExit75AsRunning(t *testing.T) {
+	log := NewLog(filepath.Join(t.TempDir(), "audit.jsonl"))
+	now := time.Now().UTC()
+	if err := log.Append(Entry{
+		StartedAt: now.Add(-time.Second), FinishedAt: now,
+		Profile: "srv1", Command: "remote-exit-75", ExitCode: 75,
+		RunID: "run-75", Status: "completed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Complete("run-75", now.Add(-time.Second), now, 75); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := log.Read("", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+}
+
+func TestCompleteSkipsPendingFinalizationError(t *testing.T) {
+	log := NewLog(filepath.Join(t.TempDir(), "audit.jsonl"))
+	started := time.Now().UTC().Add(-time.Minute)
+	finished := started.Add(30 * time.Second)
+	for _, entry := range []Entry{
+		{StartedAt: started, Profile: "srv1", Command: "deploy", ExitCode: 75, RunID: "run-pending", Status: "running"},
+		{StartedAt: finished, Profile: "srv1", Command: "deploy", ExitCode: 1, RunID: "run-pending", Status: "pending", Error: "local_error"},
+	} {
+		if err := log.Append(entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := log.Complete("run-pending", started, finished, 0); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := log.Read("", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 || entries[2].Status != "completed" || entries[2].ExitCode != 0 {
+		t.Fatalf("entries = %#v", entries)
+	}
+}
+
+type failingReader struct {
+	data []byte
+	done bool
+	err  error
+}
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if !r.done {
+		r.done = true
+		return copy(p, r.data), nil
+	}
+	return 0, r.err
+}
+
+func TestScanEntriesSurfacesReadFailure(t *testing.T) {
+	want := errors.New("storage read failed")
+	err := scanEntries(&failingReader{
+		data: []byte("{\"profile\":\"srv\"}\n"),
+		err:  want,
+	}, func(Entry) {})
+	if !errors.Is(err, want) {
+		t.Fatalf("error = %v, want %v", err, want)
+	}
+}
+
+var _ io.Reader = (*failingReader)(nil)

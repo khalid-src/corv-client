@@ -20,9 +20,11 @@ const usage = `corv - the SSH client for AI agents and humans
 Usage:
   corv                     open the interactive UI (TUI)
   corv <name>              connect to a saved machine
-  corv <name> -- <cmd>     run a command on a saved machine
-  corv <name> --stdin      read a remote shell command from stdin
-  corv <name> --stdin-base64
+  corv <name> [--run-key KEY] -- <cmd>
+                           run a command on a saved machine
+  corv <name> [--run-key KEY] --stdin
+                           read a remote shell command from stdin
+  corv <name> [--run-key KEY] --stdin-base64
                            read a base64-encoded UTF-8 command from stdin
   corv add <name> <user@host> [--port N] [--key PATH] [--jump user@bastion]
   corv import [path]       import hosts from an SSH config
@@ -33,7 +35,8 @@ Usage:
   corv disconnect <name>   drop the held-open connection
   corv output <run-id> [pattern]
                            show bounded async run output (--json for tools)
-  corv log [name]          show recent command history (--clear to wipe it)
+  corv jobs                list known active and recently retained runs (--json)
+  corv log [name]          show command history (--json; --clear erases the entire audit log)
   corv doctor [name]       check the local setup (--full for details)
   corv vault reset         clear stored credentials (--all removes connections too)
   corv update              download and install the latest release
@@ -97,6 +100,8 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return cmdOutput(args[1:], stdout, stderr)
 		case "status":
 			return cmdStatus(args[1:], stdout, stderr)
+		case "jobs":
+			return cmdJobs(args[1:], stdout, stderr)
 		}
 	}
 

@@ -9,9 +9,12 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/khalid-src/corv-client/internal/profile"
 	"github.com/khalid-src/corv-client/internal/sshconn"
+	"github.com/khalid-src/corv-client/internal/statelock"
+	"github.com/khalid-src/corv-client/internal/vault"
 )
 
 func TestConnectionTestSuccessClosesOneOffConnection(t *testing.T) {
@@ -138,6 +141,62 @@ func TestConnectionTestSurfacesVaultFailureAsLocalError(t *testing.T) {
 	}
 	if !strings.Contains(result.failureDetail(), "stored credentials") {
 		t.Fatalf("detail = %q", result.failureDetail())
+	}
+}
+
+func TestConnectionStateDoesNotMixProfileAndCredentialVersions(t *testing.T) {
+	p := profile.Profile{Name: "srv1", Target: "old.example.com", SecretRef: "profile:srv1"}
+	d := connectionTestDeps(t, p)
+	if err := d.secrets.Set(p.SecretRef, vault.Secret{Password: "old-password"}); err != nil {
+		t.Fatal(err)
+	}
+
+	writerReady := make(chan struct{})
+	releaseWriter := make(chan struct{})
+	writerDone := make(chan error, 1)
+	go func() {
+		writerDone <- statelock.WithLock(func() error {
+			if err := d.secrets.Set(p.SecretRef, vault.Secret{Password: "new-password"}); err != nil {
+				return err
+			}
+			close(writerReady)
+			<-releaseWriter
+			reg, err := d.store.Load()
+			if err != nil {
+				return err
+			}
+			updated, _ := reg.Get(p.Name)
+			updated.Target = "new.example.com"
+			if err := reg.Set(updated); err != nil {
+				return err
+			}
+			return d.store.Save(reg)
+		})
+	}()
+	<-writerReady
+
+	type result struct {
+		state connectionState
+		ok    bool
+		err   error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		state, ok, err := loadConnectionState(d, p.Name)
+		resultCh <- result{state: state, ok: ok, err: err}
+	}()
+	select {
+	case got := <-resultCh:
+		t.Fatalf("snapshot bypassed state transaction: %#v", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseWriter)
+	if err := <-writerDone; err != nil {
+		t.Fatal(err)
+	}
+	got := <-resultCh
+	if got.err != nil || !got.ok || got.state.profile.Target != "new.example.com" || got.state.secret.Password != "new-password" {
+		t.Fatalf("state=%#v ok=%v err=%v", got.state, got.ok, got.err)
 	}
 }
 

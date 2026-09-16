@@ -163,6 +163,19 @@ func TestSignalsSurfacesWarningsAndErrors(t *testing.T) {
 	}
 }
 
+func TestSignalsKeepsMixedFailuresAndDropsReassuringCounts(t *testing.T) {
+	text := strings.Join([]string{
+		"Tests: 12 passed, 0 failed",
+		"No warnings",
+		"0 failed, 1 error",
+		"no warnings; fatal: disk full",
+	}, "\n")
+	got := Signals(text, 10)
+	if len(got) != 2 || got[0] != "0 failed, 1 error" || got[1] != "no warnings; fatal: disk full" {
+		t.Fatalf("signals = %#v", got)
+	}
+}
+
 func TestSignalsCap(t *testing.T) {
 	var lines []string
 	for i := 0; i < 50; i++ {
@@ -170,5 +183,34 @@ func TestSignalsCap(t *testing.T) {
 	}
 	if got := Signals(strings.Join(lines, "\n"), 5); len(got) != 5 {
 		t.Fatalf("expected cap 5, got %d", len(got))
+	}
+}
+
+func TestSignalsIgnoreEmptySectionHeadings(t *testing.T) {
+	text := strings.Join([]string{
+		"=== FAILED UNITS ===",
+		"=== WARNINGS ===",
+		"--- ERRORS ---",
+		"Result: 0 failed",
+		"api.service loaded failed failed API service",
+		"=== FAILED UNITS: 2 ===",
+		"=== ERROR: disk full ===",
+	}, "\n")
+	want := []string{
+		"api.service loaded failed failed API service",
+		"=== FAILED UNITS: 2 ===",
+		"=== ERROR: disk full ===",
+	}
+	got := Signals(text, 10)
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("signals = %#v, want %#v", got, want)
+	}
+	f := New(Options{})
+	_, _ = f.Write([]byte(text + "\n"))
+	if strings.Join(f.Signals(), "\n") != strings.Join(want, "\n") {
+		t.Fatalf("streaming signals = %#v, want %#v", f.Signals(), want)
+	}
+	if !strings.Contains(f.String(), "=== FAILED UNITS ===") {
+		t.Fatal("section heading was removed from output")
 	}
 }

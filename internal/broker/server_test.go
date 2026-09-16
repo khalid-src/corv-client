@@ -143,6 +143,69 @@ func TestClientStatusTreatsUnsupportedOperationAsIncompatible(t *testing.T) {
 	}
 }
 
+func TestClientStatusSurfacesBrokerProtocolFailure(t *testing.T) {
+	t.Setenv("CORV_HOME", t.TempDir())
+	ln, addr, err := listenBroker()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = ln.Close()
+		cleanupBroker(addr)
+	})
+
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ep := endpoint{
+		Addr:       addr,
+		Token:      "test-token",
+		PID:        os.Getpid(),
+		Version:    version.Version,
+		ExePath:    self,
+		ExeModTime: info.ModTime().UnixNano(),
+		ExeSize:    info.Size(),
+	}
+	if err := writeEndpoint(ep); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		if _, err := reader.ReadString('\n'); err != nil {
+			done <- err
+			return
+		}
+		var req Request
+		if err := json.NewDecoder(reader).Decode(&req); err != nil {
+			done <- err
+			return
+		}
+		_, err = io.WriteString(conn, "not-json\n")
+		done <- err
+	}()
+
+	running, connections, err := NewClient(self).Status()
+	if err == nil || running || len(connections) != 0 || !strings.Contains(err.Error(), "inspect broker") {
+		t.Fatalf("running=%v connections=%#v err=%v", running, connections, err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestClientShutdownDoesNotStartBroker(t *testing.T) {
 	t.Setenv("CORV_HOME", t.TempDir())
 	path, err := endpointPath()
@@ -534,8 +597,14 @@ func TestJobForDoesNotResurrectPersistedDoneRun(t *testing.T) {
 	old := newJob(command, "fingerprint")
 	old.started = true
 	old.startedAt = time.Now()
+	old.finishedAt = old.startedAt.Add(time.Second)
 	old.done = true
 	old.status = jobStatusDone
+	if _, err := (&server{}).saveRunLog(old.id, []byte("complete\n"), runMetadata{
+		ExitCode: 0, OK: true, Connection: "srv1", StartedAt: old.startedAt, FinishedAt: old.finishedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	registry := jobRegistry{Jobs: map[string]jobRecord{
 		jobKey("srv1", command): newJobRecord("srv1", old),
 	}}
@@ -1070,8 +1139,9 @@ func TestBrokerOutputReportsDistinctRunStates(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !resp.Running || resp.ExitCode != 75 ||
-			resp.Error != "run still in progress; re-run the command or corv output later" {
+		if !resp.Running || resp.ExitCode != 75 || resp.Stdout != "pending\n" ||
+			resp.Error != "remote process has not exited; recent output follows" ||
+			resp.OriginalBytes != int64(len("pending\n")) {
 			t.Fatalf("response = %#v", resp)
 		}
 	})
@@ -1102,10 +1172,310 @@ func TestBrokerOutputReportsDistinctRunStates(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if resp.Error != "run state expired before its log could be saved" {
+		if resp.Error != "remote run state is no longer available; its exit status is unknown" {
 			t.Fatalf("response = %#v", resp)
 		}
+		if resp.Kind != "run_expired" {
+			t.Fatalf("response kind = %q", resp.Kind)
+		}
+		rec, ok := loadPersistedTestJob(t, "srv1", "expired-run")
+		if !ok || rec.Status != "expired" || rec.FinishedAt != 0 {
+			t.Fatalf("persisted record = %#v, found=%v", rec, ok)
+		}
+		runs, err := client.Jobs()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(runs) != 1 || runs[0].RunID != execResp.RunID || runs[0].Status != jobStatusExpired || runs[0].ExitCode != nil || runs[0].FinishedAt != nil {
+			t.Fatalf("runs = %#v", runs)
+		}
 	})
+}
+
+func TestRunKeyDoesNotExecuteAgainAfterRemoteStateExpires(t *testing.T) {
+	t.Setenv("CORV_WAIT", "0s")
+	jobs := newAsyncJobTestHandler(func(string) (string, int) { return "started\n", 0 })
+	jobs.rcAfter.Store(1000)
+	server := startBrokerTestSSHServerStdin(t, false, jobs.HandleStdin)
+	defer server.cleanup()
+	startBrokerForTest(t, server)
+
+	client := NewClient("unused")
+	first, err := client.ExecKeyed("srv1", []string{"deploy"}, "change-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Running {
+		t.Fatalf("first response = %#v", first)
+	}
+	jobs.mu.Lock()
+	delete(jobs.logs, first.RunID)
+	delete(jobs.rcs, first.RunID)
+	jobs.mu.Unlock()
+	if _, err := client.Close("srv1"); err != nil {
+		t.Fatal(err)
+	}
+
+	expired, err := client.ExecKeyed("srv1", []string{"deploy"}, "change-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expired.Kind != "run_expired" || expired.RunID != first.RunID {
+		t.Fatalf("expired response = %#v", expired)
+	}
+	retry, err := client.ExecKeyed("srv1", []string{"deploy"}, "change-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.Kind != "run_expired" || retry.OK || retry.Running || retry.RunID != first.RunID {
+		t.Fatalf("retry response = %#v", retry)
+	}
+	if starts := jobs.starts.Load(); starts != 1 {
+		t.Fatalf("remote command started %d times", starts)
+	}
+}
+
+func TestBrokerRunKeyReturnsRetainedOutcomeWithoutRerun(t *testing.T) {
+	t.Setenv("CORV_WAIT", "0s")
+	jobs := newAsyncJobTestHandler(func(command string) (string, int) {
+		return "completed " + command + "\n", 0
+	})
+	server := startBrokerTestSSHServerStdin(t, false, jobs.HandleStdin)
+	defer server.cleanup()
+	startBrokerForTest(t, server)
+
+	client := NewClient("unused")
+	first, err := client.ExecKeyed("srv1", []string{"deploy"}, "change-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.OK || first.RunID == "" || first.Stdout != "completed deploy\n" {
+		t.Fatalf("first response = %#v", first)
+	}
+	second, err := client.ExecKeyed("srv1", []string{"deploy"}, "change-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.OK || second.RunID != first.RunID || second.Stdout != first.Stdout {
+		t.Fatalf("replayed response = %#v, first = %#v", second, first)
+	}
+	if starts := jobs.starts.Load(); starts != 1 {
+		t.Fatalf("remote command started %d times", starts)
+	}
+}
+
+func TestBrokerRunKeyRejectsChangedCommand(t *testing.T) {
+	t.Setenv("CORV_WAIT", "0s")
+	jobs := newAsyncJobTestHandler(func(command string) (string, int) { return command + "\n", 0 })
+	server := startBrokerTestSSHServerStdin(t, false, jobs.HandleStdin)
+	defer server.cleanup()
+	startBrokerForTest(t, server)
+
+	client := NewClient("unused")
+	if resp, err := client.ExecKeyed("srv1", []string{"first"}, "change-42"); err != nil || !resp.OK {
+		t.Fatalf("first response = %#v, err=%v", resp, err)
+	}
+	resp, err := client.ExecKeyed("srv1", []string{"second"}, "change-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.OK || resp.Kind != "run_key_conflict" || !strings.Contains(resp.Error, "different command or connection state") {
+		t.Fatalf("conflict response = %#v", resp)
+	}
+	if starts := jobs.starts.Load(); starts != 1 {
+		t.Fatalf("remote command started %d times", starts)
+	}
+}
+
+func TestBrokerRunKeySurvivesOutputFinalization(t *testing.T) {
+	t.Setenv("CORV_WAIT", "0s")
+	jobs := newAsyncJobTestHandler(func(command string) (string, int) {
+		return "completed " + command + "\n", 0
+	})
+	jobs.rcAfter.Store(2)
+	server := startBrokerTestSSHServerStdin(t, false, jobs.HandleStdin)
+	defer server.cleanup()
+	startBrokerForTest(t, server)
+
+	client := NewClient("unused")
+	first, err := client.ExecKeyed("srv1", []string{"deploy"}, "change-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Running || first.RunID == "" {
+		t.Fatalf("first response = %#v", first)
+	}
+	jobs.rcAfter.Store(1)
+	finished, err := client.Output(first.RunID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !finished.OK || finished.RunID != first.RunID || finished.Stdout != "completed deploy\n" {
+		t.Fatalf("finalized response = %#v", finished)
+	}
+	replayed, err := client.ExecKeyed("srv1", []string{"deploy"}, "change-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replayed.OK || replayed.RunID != first.RunID || replayed.Stdout != finished.Stdout {
+		t.Fatalf("replayed response = %#v", replayed)
+	}
+	if starts := jobs.starts.Load(); starts != 1 {
+		t.Fatalf("remote command started %d times", starts)
+	}
+}
+
+func TestRunKeySurvivesBrokerStateReload(t *testing.T) {
+	t.Setenv("CORV_HOME", t.TempDir())
+	now := fixedRetentionTime()
+	started := now.Add(-2 * time.Hour)
+	finished := started.Add(time.Minute)
+	runID := "0000000000000000-aabb"
+	command := "deploy"
+	runKey := "change-42"
+	fingerprint := "fingerprint"
+	s := &server{now: func() time.Time { return now }, jobs: jobRegistry{Jobs: map[string]jobRecord{}}, entries: map[string]*entry{}}
+	if path, err := s.saveRunLog(runID, []byte("done\n"), runMetadata{
+		ExitCode: 0, OK: true, Connection: "srv1", StartedAt: started, FinishedAt: finished,
+	}); err != nil || path == "" {
+		t.Fatalf("save retained run: %v", err)
+	}
+	key := keyedJobKey("srv1", runKey)
+	s.jobs.Jobs[key] = jobRecord{
+		Key: key, RunID: runID, Profile: "srv1", CommandHash: valueHash(command), RunKeyHash: valueHash(runKey),
+		Fingerprint: fingerprint, StartedAt: started.Unix(), FinishedAt: finished.UnixNano(), Status: jobStatusDone,
+	}
+	if err := saveJobRegistry(s.jobs); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadJobRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := &server{now: func() time.Time { return now }, jobs: loaded, entries: map[string]*entry{}}
+	e := restarted.entryFor("srv1")
+	e.mu.Lock()
+	e.fingerprint = fingerprint
+	e.mu.Unlock()
+	j, err := restarted.jobForRequest(e, "srv1", command, fingerprint, runKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !j.completed() || j.id != runID {
+		t.Fatalf("reloaded job = %#v", j)
+	}
+	resp := restarted.output(Request{RunID: runID})
+	if !resp.OK || resp.Stdout != "done\n" || resp.RunID != runID {
+		t.Fatalf("retained response = %#v", resp)
+	}
+}
+
+func TestRunKeyRejectsChangedConnectionFingerprint(t *testing.T) {
+	now := fixedRetentionTime()
+	runKey := "change-42"
+	command := "deploy"
+	key := keyedJobKey("srv1", runKey)
+	s := &server{now: func() time.Time { return now }, jobs: jobRegistry{Jobs: map[string]jobRecord{
+		key: {
+			Key: key, RunID: "0000000000000000-aabb", Profile: "srv1",
+			CommandHash: valueHash(command), RunKeyHash: valueHash(runKey), Fingerprint: "old",
+			Status: jobStatusDone, StartedAt: now.Add(-time.Minute).Unix(), FinishedAt: now.UnixNano(),
+		},
+	}}}
+	e := &entry{jobs: map[string]*job{}, fingerprint: "new"}
+	e.cond = sync.NewCond(&e.mu)
+	if _, err := s.jobForRequest(e, "srv1", command, "new", runKey); !errors.Is(err, errRunKeyConflict) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestExpiredRunKeyCanBeUsedAgain(t *testing.T) {
+	t.Setenv("CORV_HOME", t.TempDir())
+	now := fixedRetentionTime()
+	runKey := "change-42"
+	command := "deploy"
+	key := keyedJobKey("srv1", runKey)
+	finished := now.Add(-jobTTL - time.Minute)
+	s := &server{
+		entries: map[string]*entry{},
+		now:     func() time.Time { return now },
+		jobs: jobRegistry{Jobs: map[string]jobRecord{
+			key: {
+				Key: key, RunID: "0000000000000000-aabb", Profile: "srv1",
+				CommandHash: valueHash(command), RunKeyHash: valueHash(runKey), Fingerprint: "fingerprint",
+				Status: jobStatusDone, StartedAt: finished.Add(-time.Minute).Unix(), FinishedAt: finished.UnixNano(),
+			},
+		}},
+	}
+	e := s.entryFor("srv1")
+	e.mu.Lock()
+	e.fingerprint = "fingerprint"
+	e.mu.Unlock()
+
+	j, err := s.jobForRequest(e, "srv1", "replacement", "fingerprint", runKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.id == "0000000000000000-aabb" || j.command != "replacement" {
+		t.Fatalf("job = %#v", j)
+	}
+	if _, ok := s.persistedJobByKey(key); ok {
+		t.Fatal("expired run-key record was retained")
+	}
+}
+
+func TestCompletedJobRetainsRemoteStateWhenRegistryWriteFails(t *testing.T) {
+	t.Setenv("CORV_HOME", t.TempDir())
+	j := newJob("deploy", "fingerprint")
+	j.key = jobKey("srv1", j.command)
+	j.started = true
+	j.startedAt = time.Now().Add(-time.Second)
+	j.status = jobStatusRunning
+	e := &entry{jobs: map[string]*job{j.key: j}, fingerprint: "fingerprint"}
+	e.cond = sync.NewCond(&e.mu)
+	s := &server{
+		entries: map[string]*entry{"srv1": e},
+		jobs:    jobRegistry{Jobs: map[string]jobRecord{j.key: newJobRecord("srv1", j)}},
+	}
+	original := writeJobFile
+	writeJobFile = func(string, []byte, os.FileMode) error { return errors.New("disk unavailable") }
+	t.Cleanup(func() { writeJobFile = original })
+
+	resp, saved := s.finishJobPoll(e, profile.Profile{Name: "srv1"}, profile.Registry{}, j, jobPoll{done: true}, "done\n", 5)
+	if saved || resp.Running || resp.Kind != "local_error" || !strings.Contains(resp.Error, "could not persist") {
+		t.Fatalf("response = %#v, saved=%v", resp, saved)
+	}
+	if !j.finalizePending() {
+		t.Fatal("job was not kept pending for finalization")
+	}
+}
+
+func TestUnkeyedDoneRecordWithoutRetainedLogReattaches(t *testing.T) {
+	t.Setenv("CORV_HOME", t.TempDir())
+	command := "deploy"
+	key := jobKey("srv1", command)
+	runID := "0000000000000000-aacd"
+	s := &server{
+		entries: map[string]*entry{},
+		jobs: jobRegistry{Jobs: map[string]jobRecord{
+			key: {
+				Key: key, RunID: runID, Profile: "srv1", Fingerprint: "fingerprint",
+				Status: jobStatusDone, StartedAt: time.Now().Add(-time.Minute).Unix(), ExitCode: 0,
+			},
+		}},
+	}
+	e := s.entryFor("srv1")
+	e.mu.Lock()
+	e.fingerprint = "fingerprint"
+	e.mu.Unlock()
+
+	j, err := s.jobForRequest(e, "srv1", command, "fingerprint", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.id != runID || !j.finalizePending() {
+		t.Fatalf("job = %#v", j)
+	}
 }
 
 func TestBrokerOutputReadsLegacyLogWithoutMetadata(t *testing.T) {
@@ -1151,14 +1521,14 @@ func TestBrokerOutputRecordsDetachedCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &server{audit: log}
-	if path := s.saveRunLog(runID, []byte("failed\n"), runMetadata{
+	if path, err := s.saveRunLog(runID, []byte("failed\n"), runMetadata{
 		ExitCode:   17,
 		OK:         false,
 		Connection: "srv1",
 		StartedAt:  started,
 		FinishedAt: finished,
-	}); path == "" {
-		t.Fatal("save run log failed")
+	}); err != nil || path == "" {
+		t.Fatalf("save run log: %v", err)
 	}
 	resp := s.output(Request{RunID: runID})
 	if resp.ExitCode != 17 || resp.OK {
@@ -1204,7 +1574,7 @@ func TestBrokerLeavesRemoteLogWhenLocalSaveFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Running || !resp.OK {
+	if resp.Running || resp.OK || resp.Kind != "local_error" || resp.ExitCode != 1 {
 		t.Fatalf("completion response = %#v", resp)
 	}
 	if resp.RunID != first.RunID {
@@ -1242,6 +1612,184 @@ func TestBrokerLeavesRemoteLogWhenLocalSaveFails(t *testing.T) {
 	}
 }
 
+func TestBrokerOutputKeepsFinalizationPendingWhenLocalSaveFails(t *testing.T) {
+	t.Setenv("CORV_WAIT", "0s")
+	jobs := newAsyncJobTestHandler(func(string) (string, int) { return "retained\n", 9 })
+	jobs.rcAfter.Store(1000)
+	server := startBrokerTestSSHServerStdin(t, false, jobs.HandleStdin)
+	defer server.cleanup()
+	startBrokerForTest(t, server)
+
+	client := NewClient("unused")
+	first, err := client.Exec("srv1", []string{"output-save-failure"})
+	if err != nil || !first.Running {
+		t.Fatalf("first response = %#v, err=%v", first, err)
+	}
+	p, err := paths.Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs.rcAfter.Store(0)
+	originalWrite := writeJobFile
+	t.Cleanup(func() { writeJobFile = originalWrite })
+	blocked := filepath.Join(p.RunsDir, first.RunID+".log")
+	writeJobFile = func(path string, data []byte, mode os.FileMode) error {
+		if path == blocked {
+			return errors.New("runs directory unavailable")
+		}
+		return originalWrite(path, data, mode)
+	}
+
+	resp, err := client.Output(first.RunID, "")
+	writeJobFile = originalWrite
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Kind != "local_error" || resp.RunID != first.RunID {
+		t.Fatalf("output response = %#v", resp)
+	}
+	rec, ok := loadPersistedTestJob(t, "srv1", "output-save-failure")
+	if !ok || rec.Status != jobStatusFinalizePending || rec.ExitCode != 9 {
+		t.Fatalf("persisted job = %#v, present=%v", rec, ok)
+	}
+	retry, err := client.Output(first.RunID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.OK || retry.ExitCode != 9 || retry.Stdout != "retained\n" {
+		t.Fatalf("retry response = %#v", retry)
+	}
+	if got := jobs.starts.Load(); got != 1 {
+		t.Fatalf("remote job started %d times, want 1", got)
+	}
+}
+
+func TestBrokerRetainsPendingStateWhenDonePersistenceFails(t *testing.T) {
+	t.Setenv("CORV_WAIT", "0s")
+	jobs := newAsyncJobTestHandler(func(string) (string, int) { return "durable\n", 0 })
+	jobs.rcAfter.Store(1000)
+	server := startBrokerTestSSHServerStdin(t, false, jobs.HandleStdin)
+	defer server.cleanup()
+	startBrokerForTest(t, server)
+
+	client := NewClient("unused")
+	first, err := client.Exec("srv1", []string{"done-persist-failure"})
+	if err != nil || !first.Running {
+		t.Fatalf("first response = %#v, err=%v", first, err)
+	}
+	jobs.rcAfter.Store(0)
+	originalWrite := writeJobFile
+	t.Cleanup(func() { writeJobFile = originalWrite })
+	writeJobFile = func(path string, data []byte, mode os.FileMode) error {
+		if filepath.Base(path) == "jobs.json" && bytes.Contains(data, []byte(`"status": "done"`)) {
+			return errors.New("registry unavailable")
+		}
+		return originalWrite(path, data, mode)
+	}
+
+	resp, err := client.Exec("srv1", []string{"done-persist-failure"})
+	writeJobFile = originalWrite
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Kind != "local_error" || !strings.Contains(resp.Error, "final state") {
+		t.Fatalf("completion response = %#v", resp)
+	}
+	rec, ok := loadPersistedTestJob(t, "srv1", "done-persist-failure")
+	if !ok || rec.Status != jobStatusFinalizePending {
+		t.Fatalf("persisted job = %#v, present=%v", rec, ok)
+	}
+	if got := jobs.cleanups.Load(); got != 0 {
+		t.Fatalf("remote job cleaned before final state was durable: %d", got)
+	}
+	retry, err := client.Exec("srv1", []string{"done-persist-failure"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !retry.OK || retry.RunID != first.RunID || retry.Stdout != "durable\n" {
+		t.Fatalf("retry response = %#v", retry)
+	}
+	if got := jobs.starts.Load(); got != 1 {
+		t.Fatalf("remote job started %d times, want 1", got)
+	}
+}
+
+func TestBrokerClassifiesRetainedLogTransportFailure(t *testing.T) {
+	t.Setenv("CORV_WAIT", "0s")
+	jobs := newAsyncJobTestHandler(func(string) (string, int) { return "retained\n", 0 })
+	jobs.rcAfter.Store(1000)
+	handler := func(cmd string, stdin []byte) (string, int) {
+		if strings.Contains(cmd, "CORV_LOG_V1") {
+			return "", dropExitSentinel
+		}
+		return jobs.HandleStdin(cmd, stdin)
+	}
+	server := startBrokerTestSSHServerStdin(t, false, handler)
+	defer server.cleanup()
+	startBrokerForTest(t, server)
+
+	client := NewClient("unused")
+	first, err := client.Exec("srv1", []string{"transport-failure"})
+	if err != nil || !first.Running {
+		t.Fatalf("first response = %#v, err=%v", first, err)
+	}
+	jobs.rcAfter.Store(0)
+	resp, err := client.Exec("srv1", []string{"transport-failure"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Kind != string(sshconn.ErrDisconnect) || strings.Contains(resp.Error, "save its log locally") {
+		t.Fatalf("completion response = %#v", resp)
+	}
+}
+
+func TestBrokerDoesNotTreatMissingCompletedLogAsEmptyOutput(t *testing.T) {
+	t.Setenv("CORV_WAIT", "0s")
+	jobs := newAsyncJobTestHandler(func(string) (string, int) {
+		return "must not become empty\n", 0
+	})
+	jobs.rcAfter.Store(1000)
+	server := startBrokerTestSSHServerStdin(t, false, jobs.HandleStdin)
+	defer server.cleanup()
+	startBrokerForTest(t, server)
+
+	client := NewClient("unused")
+	first, err := client.Exec("srv1", []string{"missing-completed-log"})
+	if err != nil || !first.Running {
+		t.Fatalf("first response = %#v, err=%v", first, err)
+	}
+	jobs.mu.Lock()
+	delete(jobs.logs, first.RunID)
+	jobs.mu.Unlock()
+	jobs.rcAfter.Store(0)
+
+	resp, err := client.Exec("srv1", []string{"missing-completed-log"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.OK || resp.Running || resp.Kind != "output_unavailable" || resp.Stdout != "" {
+		t.Fatalf("completion response = %#v", resp)
+	}
+	rec, ok := loadPersistedTestJob(t, "srv1", "missing-completed-log")
+	if !ok || rec.Status != jobStatusFinalizePending || rec.ExitCode != 0 || rec.FinishedAt == 0 {
+		t.Fatalf("persisted job = %#v, present=%v", rec, ok)
+	}
+	jobs.mu.Lock()
+	delete(jobs.rcs, first.RunID)
+	jobs.mu.Unlock()
+	retry, err := client.Output(first.RunID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.Kind != "output_unavailable" || !strings.Contains(retry.Error, "status 0") {
+		t.Fatalf("response after remote cleanup = %#v", retry)
+	}
+	rec, ok = loadPersistedTestJob(t, "srv1", "missing-completed-log")
+	if !ok || rec.Status != jobStatusFinalizePending || rec.ExitCode != 0 || rec.FinishedAt == 0 {
+		t.Fatalf("persisted job after remote cleanup = %#v, present=%v", rec, ok)
+	}
+}
+
 func TestSweepLocalRunsPreservesMetadata(t *testing.T) {
 	t.Setenv("CORV_HOME", t.TempDir())
 	p, err := paths.Default()
@@ -1251,7 +1799,8 @@ func TestSweepLocalRunsPreservesMetadata(t *testing.T) {
 	if err := os.MkdirAll(p.RunsDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	old := time.Now().Add(-2 * jobTTL)
+	now := fixedRetentionTime()
+	old := now.Add(-2 * jobTTL)
 	files := map[string]bool{
 		"jobs.json":       false,
 		"old.log":         true,
@@ -1264,14 +1813,16 @@ func TestSweepLocalRunsPreservesMetadata(t *testing.T) {
 		if err := os.WriteFile(path, []byte(name), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if !strings.HasPrefix(name, "fresh.") {
-			if err := os.Chtimes(path, old, old); err != nil {
-				t.Fatal(err)
-			}
+		mtime := old
+		if strings.HasPrefix(name, "fresh.") {
+			mtime = now
+		}
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
 		}
 	}
 
-	(&server{}).sweepLocalRuns()
+	(&server{now: func() time.Time { return now }}).sweepLocalRuns()
 
 	for name, removed := range files {
 		_, err := os.Stat(filepath.Join(p.RunsDir, name))
@@ -1475,6 +2026,84 @@ func TestClientReplacesStaleBroker(t *testing.T) {
 	}
 	if ep, ok := client.currentEndpoint(); !ok || ep.Version != version.Version {
 		t.Fatalf("current endpoint = %#v, ok=%v", ep, ok)
+	}
+}
+
+func TestStaleEndpointWithReusedPIDDoesNotBlockStartup(t *testing.T) {
+	t.Setenv("CORV_HOME", t.TempDir())
+	ln, addr, err := listenBroker()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = ln.Close()
+	cleanupBroker(addr)
+	if err := writeEndpoint(endpoint{
+		Addr: addr, Token: "stale-token", PID: 4242, ProcessStart: 100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	oldStart := brokerProcessStart
+	oldExited := brokerProcessExited
+	brokerProcessStart = func(int) (uint64, error) { return 200, nil }
+	exitChecked := false
+	brokerProcessExited = func(int) (bool, error) {
+		exitChecked = true
+		return false, nil
+	}
+	t.Cleanup(func() {
+		brokerProcessStart = oldStart
+		brokerProcessExited = oldExited
+	})
+
+	if err := NewClient("unused").stopStaleBroker(); err != nil {
+		t.Fatal(err)
+	}
+	if exitChecked {
+		t.Fatal("reused process id was treated as the stale broker")
+	}
+}
+
+func TestLegacyStaleEndpointDoesNotWaitOnUnverifiedPID(t *testing.T) {
+	t.Setenv("CORV_HOME", t.TempDir())
+	ln, addr, err := listenBroker()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = ln.Close()
+	cleanupBroker(addr)
+	if err := writeEndpoint(endpoint{Addr: addr, Token: "stale-token", PID: 4242}); err != nil {
+		t.Fatal(err)
+	}
+
+	oldExited := brokerProcessExited
+	exitChecked := false
+	brokerProcessExited = func(int) (bool, error) {
+		exitChecked = true
+		return false, nil
+	}
+	t.Cleanup(func() { brokerProcessExited = oldExited })
+
+	if err := NewClient("unused").stopStaleBroker(); err != nil {
+		t.Fatal(err)
+	}
+	if exitChecked {
+		t.Fatal("unreachable legacy endpoint trusted an unverified process id")
+	}
+}
+
+func TestSpawnReportsBrokerLogOpenFailure(t *testing.T) {
+	t.Setenv("CORV_HOME", t.TempDir())
+	path, err := brokerLogPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err = NewClient("unused").spawn()
+	if err == nil || !strings.Contains(err.Error(), "open broker log") {
+		t.Fatalf("error = %v", err)
 	}
 }
 
@@ -1813,13 +2442,16 @@ func startBrokerProcessForTest(t *testing.T, server testSSHServer) <-chan error 
 
 func stopBrokerProcessForTest(t *testing.T, errc <-chan error) {
 	t.Helper()
-	_ = NewClient("unused").Shutdown()
+	shutdownErr := NewClient("unused").Shutdown()
 	select {
 	case err := <-errc:
 		if err != nil {
 			t.Fatalf("broker Serve: %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
+		if shutdownErr != nil {
+			t.Fatalf("broker shutdown request: %v", shutdownErr)
+		}
 		t.Fatal("broker did not stop")
 	}
 }
@@ -1838,7 +2470,7 @@ func handleBrokerTestSession(ch ssh.Channel, requests <-chan *ssh.Request, h fun
 				_ = req.Reply(true, nil)
 			}
 			var stdin []byte
-			if strings.Contains(cmd, `cat > "$dir/`) {
+			if strings.Contains(cmd, `cat > "$dir/`) || strings.Contains(cmd, `cat > "$upload"`) {
 				stdin, _ = io.ReadAll(ch)
 			}
 			out, code := h(cmd, stdin)
@@ -1967,6 +2599,8 @@ func newAsyncJobTestHandler(run func(string) (string, int)) *asyncJobTestHandler
 
 func (h *asyncJobTestHandler) HandleStdin(cmd string, stdin []byte) (string, int) {
 	switch {
+	case strings.Contains(cmd, `for rc in "$dir"/*.rc`):
+		return "", 0
 	case strings.Contains(cmd, "CORV_STARTED"):
 		h.starts.Add(1)
 		id := parseJobID(cmd)
@@ -1977,6 +2611,23 @@ func (h *asyncJobTestHandler) HandleStdin(cmd string, stdin []byte) (string, int
 		h.rcs[id] = code
 		h.mu.Unlock()
 		return "CORV_STARTED\n", 0
+	case strings.Contains(cmd, "CORV_PROGRESS_V1"):
+		id := parseJobID(cmd)
+		h.mu.Lock()
+		log, hasLog := h.logs[id]
+		_, hasRC := h.rcs[id]
+		h.mu.Unlock()
+		state := "missing"
+		if hasRC && h.rcCalls.Load() >= h.rcAfter.Load() {
+			state = "done"
+		} else if hasLog {
+			state = "running"
+		}
+		tail := log
+		if len(tail) > maxRunningOutputBytes {
+			tail = tail[len(tail)-maxRunningOutputBytes:]
+		}
+		return fmt.Sprintf("CORV_PROGRESS_V1 %s %d\n%s", state, len(log), tail), 0
 	case strings.Contains(cmd, "printf done") && strings.Contains(cmd, "printf missing"):
 		id := parseJobID(cmd)
 		h.mu.Lock()
@@ -2028,8 +2679,11 @@ func (h *asyncJobTestHandler) HandleStdin(cmd string, stdin []byte) (string, int
 			time.Sleep(h.fullLogDelay)
 		}
 		h.mu.Lock()
-		log := h.logs[parseJobID(cmd)]
+		log, ok := h.logs[parseJobID(cmd)]
 		h.mu.Unlock()
+		if !ok {
+			return "CORV_LOG_MISSING\n", 0
+		}
 		return frameTestLog(log), 0
 	case strings.Contains(cmd, "rm -f"):
 		id := parseJobID(cmd)

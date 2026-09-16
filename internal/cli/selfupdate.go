@@ -28,6 +28,7 @@ const (
 var (
 	removeExecutablePath = removeExecutable
 	removeAllData        = os.RemoveAll
+	renameUpdateFile     = os.Rename
 )
 
 // cmdUpdate downloads the latest released binary for this platform, verifies its
@@ -230,32 +231,44 @@ func replaceFile(exe string, data []byte) error {
 		os.Remove(tmpName)
 		return err
 	}
+	if err := tmp.Chmod(0o755); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmpName)
 		return err
 	}
-	if err := os.Chmod(tmpName, 0o755); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-
 	if runtime.GOOS == "windows" {
-		old := exe + ".old"
-		_ = os.Remove(old)
-		if err := os.Rename(exe, old); err != nil {
-			os.Remove(tmpName)
-			return fmt.Errorf("replace executable: %w", err)
-		}
-		if err := os.Rename(tmpName, exe); err != nil {
-			_ = os.Rename(old, exe) // roll back
-			os.Remove(tmpName)
-			return fmt.Errorf("replace executable: %w", err)
-		}
-		return nil
+		return replaceWindowsFile(exe, tmpName)
 	}
 
-	if err := os.Rename(tmpName, exe); err != nil {
+	if err := renameUpdateFile(tmpName, exe); err != nil {
 		os.Remove(tmpName)
+		return fmt.Errorf("replace executable: %w", err)
+	}
+	return nil
+}
+
+func replaceWindowsFile(exe, replacement string) error {
+	old := exe + ".old"
+	_ = os.Remove(old)
+	if err := renameUpdateFile(exe, old); err != nil {
+		os.Remove(replacement)
+		return fmt.Errorf("replace executable: %w", err)
+	}
+	if err := renameUpdateFile(replacement, exe); err != nil {
+		rollbackErr := renameUpdateFile(old, exe)
+		os.Remove(replacement)
+		if rollbackErr != nil {
+			return errors.Join(fmt.Errorf("replace executable: %w", err), fmt.Errorf("restore previous executable: %w", rollbackErr))
+		}
 		return fmt.Errorf("replace executable: %w", err)
 	}
 	return nil

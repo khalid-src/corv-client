@@ -17,6 +17,8 @@ type statusClient interface {
 
 var newStatusClient = func(self string) statusClient { return broker.NewClient(self) }
 
+var newDoctorClient = func(self string) statusClient { return broker.NewClient(self) }
+
 type statusConnection struct {
 	Name        string `json:"name"`
 	Target      string `json:"target,omitempty"`

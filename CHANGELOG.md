@@ -3,6 +3,105 @@
 All notable changes to Corv are documented here. Corv uses one changelog entry
 per release tag.
 
+## v1.1.1 - 2026-09-16
+
+This patch release improves recovery and diagnostics for detached agent work
+without changing saved connection, vault, or run-log formats.
+
+### Added
+
+- **`corv jobs`.** Lists active and recently retained runs by connection name,
+  run ID, status, start time, and exit code, with structured JSON output.
+- **`--run-key`.** A caller-supplied, profile-scoped key suppresses replay of a
+  mutating command. Completed outcomes remain reusable for 24 hours; unresolved
+  runs retain their key. A conflicting command or connection state fails
+  explicitly instead of executing.
+- **Structured audit history.** `corv log --json` exposes the existing audit
+  entries, and plain history includes the run ID when one is present.
+
+### Fixed
+
+- Empty decorated section headings such as `=== FAILED UNITS ===` no longer
+  appear as failure highlights; actual failure details remain highlighted.
+
+- Clarified that `corv log --clear` erases the entire audit log, and that audit
+  history currently has no automatic rotation or retention limit.
+- Documented that replay protection is scoped to one local state directory and
+  saved connection; separate clients do not share deduplication records.
+
+- **Vault access failures are actionable.** Windows DPAPI and Unix keychain
+  failures retain the underlying error while identifying unavailable user,
+  profile, session, or keychain context.
+- **Doctor checks encrypted state.** `corv doctor` verifies the connection store
+  and referenced credentials without migrating state, starting the broker, or
+  exposing detailed local information by default.
+- **Running output is visible and bounded.** `corv output <run-id>` returns a
+  recent-output snapshot while a detached process is active, without consuming
+  the run's output offset or sending an unbounded log to the caller.
+- **Stale runs no longer claim to be active.** Unverified old records are shown
+  as `unknown`; an explicit output probe records missing remote state as
+  `expired` without fabricating an exit code or completion timestamp. Expired
+  run keys remain reserved to prevent an uncertain operation from executing
+  twice.
+- **Run-key outcomes survive every completion path.** Finalizing through
+  `corv output`, restarting the broker, or retrying after a lost response does
+  not discard the retained replay record. Nonzero exit codes are preserved in
+  persisted job state.
+- **Terminal-state persistence is fail-safe.** If completed job state cannot be
+  saved, Corv retains the remote output and leaves the job pending for a safe
+  finalization retry, returning a typed local error instead of success. Final
+  state is committed only after the retained log is durable. A missing log does
+  not erase a known remote exit status and is reported as `output_unavailable`.
+- **Detached timing reflects execution.** New remote exit records preserve the
+  command's execution duration, so delayed polling no longer inflates
+  `duration_ms`. Existing run records remain readable.
+- **Remote cleanup uses completion age.** A long-running job is not swept merely
+  because it started more than 24 hours ago; new records are aged from their
+  terminal exit time.
+- **Lossy text conversion is disclosed.** JSON output sets `lossy: true` when
+  invalid UTF-8 bytes must be replaced, and reassuring counts such as
+  `0 failed` no longer appear as warning highlights.
+- **Vault requirements are documented before failure.** Agent and operator
+  guidance explains that the encrypted store requires the OS user profile and
+  keychain context that created it.
+- **Structured output failures remain typed.** `corv output --json` includes an
+  `error_kind` for argument, local-state, broker, metadata, and finalization
+  failures, and includes an empty value on success for a stable schema.
+- **SSH config imports follow inclusion context.** Global directives and nested
+  `Include` files retain OpenSSH first-value semantics. Imported keys,
+  credentials, and profiles roll back together when the profile save fails.
+- **Local diagnostics and IPC fail honestly.** Unix broker directories and
+  sockets enforce owner-only permissions; doctor distinguishes inaccessible
+  state from missing state; local history write failures are surfaced without
+  changing the remote result.
+- **Connection reads are transactionally consistent.** Interactive sessions and
+  diagnostics cannot combine an old endpoint with newly replaced credentials.
+  CLI replacements use fresh credential references, and missing referenced
+  credentials fail consistently in every connection mode.
+- **Broker replacement verifies process identity.** A reused operating-system
+  process ID, including one from a legacy endpoint record, cannot block startup,
+  and broker-log creation failures are reported.
+- **Local history and keychain access are bounded.** Tail reads and completion
+  checks avoid loading the full audit history, and OS keychain commands cannot
+  block indefinitely.
+- **Release inputs are reproducible.** Third-party actions are pinned to commit
+  SHAs, and analysis tools use fixed module versions.
+- **Build dependencies include current security fixes.** Release and CI builds
+  use Go 1.26.8 and `golang.org/x/crypto` 0.56.0.
+- **Detached script uploads are verified before launch.** Corv checks the exact
+  streamed byte count, so an interrupted upload cannot execute a partial
+  command.
+- **Persisted run identity contains no offline credential verifier.**
+  Vault-keyed fingerprints detect destination, route, and credential changes
+  without making password guesses testable from `jobs.json`; existing records
+  migrate when their saved connection is next resolved.
+- **Exit code 75 is unambiguous in command history.** New entries record their
+  lifecycle explicitly, so a remote command that genuinely exits with 75 is
+  not mistaken for an unfinished run.
+- **In-place updates are crash-durable.** Replacement binaries are synced
+  before installation, and a failed Windows rollback is reported rather than
+  hidden.
+
 ## v1.1 - 2026-07-23
 
 A reliability and compatibility release with focused connection diagnostics.

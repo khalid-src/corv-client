@@ -104,28 +104,25 @@ func parseTestArgs(args []string) (string, bool, bool, error) {
 }
 
 func testSavedConnection(d deps, name string) connectionTestResult {
-	reg, err := d.store.Load()
+	state, ok, err := loadConnectionState(d, name)
 	if err != nil {
+		var stateErr *connectionStateError
+		if errors.As(err, &stateErr) {
+			return failedConnectionTest(name, stateErr.stage, stateErr.kind, stateErr.Error())
+		}
 		return failedConnectionTest(name, "local", "local_error", err.Error())
 	}
-	p, ok := reg.Get(name)
 	if !ok {
 		return failedConnectionTest(name, "local", "unknown_connection", fmt.Sprintf("unknown connection %q", name))
 	}
-	return runConnectionTest(d, reg, p)
+	return runConnectionTest(state)
 }
 
-func runConnectionTest(d deps, reg profile.Registry, p profile.Profile) connectionTestResult {
+func runConnectionTest(state connectionState) connectionTestResult {
+	p := state.profile
 	result := connectionTestResult{Connection: p.Name, Stages: []connectionTestStage{}}
-	jumps, err := sshconn.ParseJumpChain(p.ProxyJump)
-	if err != nil {
-		return result.fail("jump", "fail", err.Error(), "bad_request")
-	}
-	if err := sshconn.EnrichJumpChain(jumps, reg, nil); err != nil {
-		return result.fail("jump", "fail", err.Error(), "bad_request")
-	}
 
-	endpoints := diagnosticEndpoints(p, jumps)
+	endpoints := diagnosticEndpoints(p, state.jumps)
 	for _, endpoint := range endpoints {
 		if endpoint.routed {
 			result.add("resolve", "warn", endpoint.label+" is resolved through the SSH route")
@@ -150,25 +147,21 @@ func runConnectionTest(d deps, reg profile.Registry, p profile.Profile) connecti
 		result.add("tcp", "ok", endpoint.label+" accepts TCP connections")
 	}
 
-	if err := sshconn.EnrichJumpChain(jumps, reg, d.jumpSecret); err != nil {
-		return result.fail("auth", "fail", err.Error(), "local_error")
-	}
-	secret, err := vaultSecret(d, p)
-	if err != nil {
-		return result.fail("auth", "fail", err.Error(), "local_error")
+	if state.authErr != nil {
+		return result.fail("auth", "fail", state.authErr.Error(), "local_error")
 	}
 	conn, err := diagnosticDialSSH(p, sshconn.DialOptions{
-		Password:   secret.Password,
-		Passphrase: secret.Passphrase,
+		Password:   state.secret.Password,
+		Passphrase: state.secret.Passphrase,
 		Timeout:    connectionTestTimeout,
-		JumpHosts:  jumps,
+		JumpHosts:  state.jumps,
 	})
 	if err != nil {
-		return classifyConnectionTestFailure(result, err, len(jumps) > 0)
+		return classifyConnectionTestFailure(result, err, len(state.jumps) > 0)
 	}
 	_ = conn.Close()
-	if len(jumps) > 0 {
-		result.add("jump", "ok", fmt.Sprintf("SSH route established through %d bastion hop(s)", len(jumps)))
+	if len(state.jumps) > 0 {
+		result.add("jump", "ok", fmt.Sprintf("SSH route established through %d bastion hop(s)", len(state.jumps)))
 	}
 	result.add("handshake", "ok", "SSH transport established")
 	result.add("hostkey", "ok", "host keys are trusted")

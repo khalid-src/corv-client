@@ -1,12 +1,17 @@
-# Corv Client
+# Corv
 
 <p align="center">
-  <img src="assets/logo.png" alt="Corv Client" width="520">
+  <img src="assets/logo.png" alt="Corv" width="520">
 </p>
 
-**The SSH client for AI agents and humans.** Connect by name. Reuse authenticated SSH connections. Keep secrets local.
+**The SSH execution layer for AI agents and humans.** Connect by name, run commands over warm authenticated connections, and get structured, bounded output with at-most-once safety for retried operations.
 
-[Latest release: Corv v1.1](docs/releases/v1.1.md) |
+[![CI](https://github.com/khalid-src/corv-client/actions/workflows/ci.yml/badge.svg)](https://github.com/khalid-src/corv-client/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/khalid-src/corv-client)](https://github.com/khalid-src/corv-client/releases)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Go](https://img.shields.io/github/go-mod/go-version/khalid-src/corv-client)](go.mod)
+
+[Latest release: Corv v1.1.1](docs/releases/v1.1.1.md) |
 [Complete changelog](CHANGELOG.md)
 
 AI agents don't use SSH the way humans do. Raw SSH requires the calling workflow
@@ -20,6 +25,33 @@ execute commands without exposing passwords or private keys, receive structured
 JSON output, reuse a warm authenticated connection, and detach and resume
 long-running jobs. Humans use the same saved connection profiles through an
 interactive terminal UI.
+
+## Built for production
+
+Corv is engineered for unattended, agent-driven work against real infrastructure:
+
+- **At-most-once execution.** A caller-supplied idempotency key makes a mutating
+  command safe to retry. A lost response, a broker restart, or a full host reboot
+  does not run it twice (verified against live hosts).
+- **Crash-safe local state.** Connection, vault, and job state are written
+  atomically, so a crash or power loss cannot corrupt or lose them.
+- **Token-lean structured output.** Combined stdout and stderr are de-noised
+  (ANSI and progress-bar collapse) and bounded to a head and tail, so a
+  multi-megabyte log never exhausts an agent's context; the full log stays
+  retrievable by run ID.
+- **Secrets never leak.** Credentials are encrypted at rest (DPAPI, Keychain, or a
+  `0600` key file) and never appear on a command line, in logs, or in agent
+  output. Run identity is a vault-keyed HMAC, so `jobs.json` carries no offline
+  password verifier.
+- **Real, verified SSH.** Host keys are checked against `known_hosts`, ProxyJump
+  bastions and `ssh-agent` are supported, and nothing is installed on the server.
+- **Detached, recoverable jobs.** Long-running commands survive client and network
+  interruption and are recoverable by run ID.
+- **Identical on Linux, macOS, and Windows.** A single dependency-free binary with
+  no daemon to manage.
+
+Structured JSON for agents, an interactive terminal UI for humans, both driving the
+same saved connections.
 
 ## Install
 
@@ -54,7 +86,7 @@ background.
 ## Usage
 
 <p align="center">
-  <img src="assets/presentation.png" alt="Corv Client - an AI agent and a human both driving the same connection" width="720">
+  <img src="assets/presentation.png" alt="Corv - an AI agent and a human both driving the same connection" width="720">
 </p>
 
 Manage connections interactively:
@@ -75,6 +107,7 @@ corv import                                          # import hosts from ~/.ssh/
 corv list
 corv test prod-api                                   # diagnose connection stages
 corv status                                          # show warm connections and active runs
+corv jobs                                            # list active and retained run IDs
 corv rm prod-api
 ```
 
@@ -85,6 +118,17 @@ host-key trust, and authentication without running a remote command. Add
 `--full`. `corv status` reports the connections the local broker currently
 holds, hides targets unless `--full` is specified, and does not start a stopped
 broker.
+
+`corv doctor` also checks whether encrypted local state and every referenced
+stored credential are readable. Its default output identifies the failure
+category without exposing paths or connection details; use `--full` only when
+detailed local diagnostics are appropriate.
+
+The encrypted store is bound to the OS user profile that created it. Run Corv
+and any agent or service that invokes it as that same OS user, with the user's
+profile and keychain context loaded. A sandbox, elevated account, service
+account, or different login may be unable to decrypt otherwise valid state;
+`corv doctor` reports this separately from SSH authentication failures.
 
 Hosts behind one or more bastions are reached with `--jump` (OpenSSH `-J`
 syntax: `user@host1,user@host2`). Jump hosts authenticate with `ssh-agent`
@@ -113,6 +157,7 @@ Run a command non-interactively (the agent path):
 corv prod-api -- uname -a
 corv prod-api --json -- df -h             # structured output for tools
 corv prod-api -- ./deploy.sh
+corv prod-api --run-key change-42 -- ./deploy.sh
 echo 'cd /app && run "$X" | grep foo' | corv prod-api --json --stdin
 corv prod-api --json --stdin < script.sh
 ```
@@ -129,6 +174,8 @@ Command handling after `--` is designed to do what you mean:
   `corv srv -- sh -lc "cd /app && make"`.
 
 This preserves argument boundaries for callers that construct command vectors.
+Detached scripts run under POSIX `sh`. Use only POSIX shell syntax, or invoke an
+available alternate shell explicitly, for example `bash -lc '...'`.
 
 For complex shell text, nested quotes, or multi-line scripts, use an stdin
 mode. `--stdin-base64` is the cross-shell-safe option because only ASCII
@@ -151,9 +198,10 @@ and any non-ASCII text survive intact. A simple exact argument vector can still
 use `-- <command>`.
 
 Long commands are detached on the server automatically. If a command is still
-running after the broker's wait window, Corv returns the new bounded output,
-the run id, and exit code `75`. Re-run the exact same command to watch the next
-delta; it attaches to the existing remote job and does not start a second copy.
+running after the broker's wait window, Corv returns bounded progress output,
+the run id, and exit code `75`. Use `corv output <run-id>` to check it without
+restarting the command. Re-running the byte-identical original command also
+reattaches while it remains active, but run IDs are the clearer recovery path.
 When the job finishes, Corv retains up to 20 MiB locally and removes the remote
 temporary files. If a log is larger, Corv keeps its first 4 MiB and its final
 section with an omission marker between them, so late failures are not lost.
@@ -162,15 +210,45 @@ section with an omission marker between them, so late failures are not lost.
 ```bash
 corv prod-api -- ./long-install.sh
 corv output <run-id> [pattern]         # bounded status/output view
-# The byte-identical original command can also reattach while it is running.
+corv jobs                              # recover active/recent run IDs
 ```
+
+For a mutating command that may be retried after a lost response, supply a
+stable run key:
+
+```bash
+corv prod-api --run-key change-42 -- ./deploy.sh
+```
+
+The key is scoped to the saved connection within one local Corv state directory.
+Two machines, or two separate state directories, do not share replay records:
+the same key can execute once in each. Keep the same client state when retrying;
+Corv does not provide fleet-wide deduplication.
+
+The same key and command reattach to
+the active run or return its retained result; using the key with a different
+command or changed connection state fails with `error_kind: run_key_conflict`.
+Completed replay records are retained for 24 hours, after which the key can be
+used again. A run without a known outcome keeps its key so Corv does not trade
+uncertain recovery for a possible duplicate execution. If Corv reports
+`run_expired`, verify the remote effect before choosing a new run key; retrying
+the expired key will not execute the command again. This is replay suppression,
+not a permanent distributed transaction. Never place credentials or other
+secrets in a run key.
+
+Command history has no automatic rotation or retention limit. `corv log --clear`
+erases the entire local audit log, including older entries. Save any history you
+need before clearing it; the 24-hour run-log retention does not apply to audit
+history.
 
 `CORV_WAIT` controls how long the broker waits before returning a `running`
 response. It accepts bare seconds (`CORV_WAIT=30`) or a Go duration
 (`CORV_WAIT=500ms`, `CORV_WAIT=2m`) and is read from the environment of each
 `corv` invocation, so it takes effect immediately without restarting the broker.
-`corv output <run-id>` checks an unfinished detached run and finalizes it
-automatically once the remote exit status exists. Remote temp files are cleaned
+`corv output <run-id>` returns a bounded recent-output snapshot while a run is
+active, then finalizes it automatically once the remote exit status exists.
+Snapshots do not consume or alter the command's saved output offset. Remote
+temp files are cleaned
 on finalization. The startup sweep removes completed remote remnants older than
 24 hours; it never deletes a run without an exit status because age alone cannot
 distinguish an abandoned run from a silent live process. Saved local run logs
@@ -185,10 +263,15 @@ return a middle-out view of roughly 32 KiB; running responses use a smaller
 budget. Pass a pattern to `corv output` to select relevant lines before that
 budget is applied. JSON responses report `original_bytes`, `saved_bytes`,
 `returned_bytes`, `truncated` (the retained log omitted bytes), and
-`output_truncated` (the returned view was bounded) when applicable.
+`output_truncated` (the returned view was bounded) when applicable. A JSON
+`lossy: true` field means invalid UTF-8 bytes were replaced for text-safe output;
+inspect the producing command or use a text-safe encoding when byte fidelity
+matters.
 
 Remote command execution requires a POSIX shell and standard Unix command-line
-tools. Windows OpenSSH servers are not supported as remote execution targets.
+tools. Scripts execute with `sh`; bash-specific syntax requires an explicit
+`bash -lc` on a host where Bash is installed. Windows OpenSSH servers are not
+supported as remote execution targets.
 
 ## Use with AI agents
 
@@ -220,6 +303,12 @@ Agents should not run `corv list --full`, `corv doctor --full`, `corv test
 modes show local connection details. Never put
 passwords, private keys, API tokens, bootstrap tokens, bearer tokens, or other
 secrets on the command line. Corv command history records command lines.
+Use `corv jobs --json` to recover active or recently retained run IDs. Its
+status is the last locally recorded state. An old run with no recent remote
+observation is shown as `unknown`, without an exit code. Use `corv output
+<run-id>` to probe it: a live run returns current progress, while missing remote
+state becomes `expired`, still without an invented exit code. Use `corv log
+--json` when structured local command history is needed.
 
 See [`integrations/README.md`](integrations/README.md) for details.
 
@@ -274,7 +363,8 @@ Corv normalises command output for programmatic consumers:
   presentation contract;
 - failures are classified (`auth_failed`, `unknown_host`,
   `unknown_connection`, `bad_request`, `local_error`, `unreachable`,
-  `host_key`, `timeout`, `disconnected`, `resource_exhausted`, `ssh_error`),
+  `host_key`, `timeout`, `disconnected`, `resource_exhausted`,
+  `run_key_conflict`, `run_expired`, `output_unavailable`, `ssh_error`),
   and the remote exit code is propagated as the process exit code.
 
 ## Security model
@@ -310,6 +400,27 @@ SSH library (`golang.org/x/crypto/ssh`).
 - The broker uses OS-permissioned local IPC (Unix socket or Windows named
   pipe) plus an endpoint token for defense in depth.
 
+### Threat model
+
+Corv trusts the local user account and the machine it runs on. Within that
+boundary it protects credentials: they are encrypted at rest, sent only over the
+authenticated SSH connection, and never written to a command line, prompt, log,
+or agent-visible output, so an agent can use a connection without the secret
+entering its context.
+
+Corv does not sandbox local execution. Anyone, or anything, able to run `corv`
+as your user can use your saved connections, exactly as they could with `ssh`,
+`ssh-agent`, or your `~/.ssh` keys and cloud credentials. Corv is a client
+acting with your authority, not a security boundary against a compromised local
+environment; a changed host key is refused, but an authorized local caller is
+trusted.
+
+Defending against untrusted local execution is therefore out of scope for the
+client and belongs to the environment: do not give untrusted or experimental
+agents shell access to a machine that holds real credentials, and enforce least
+privilege on the server (restricted users, limited `sudo`, short-lived SSH
+certificates or STS tokens, tight network rules).
+
 ## Architecture
 
 Corv is composed of small, independent modules so that the SSH backend or the
@@ -329,6 +440,9 @@ output processor can be replaced without affecting the rest:
 | `internal/atomicfile` | crash-safe atomic file writes                        |
 | `internal/paths`   | on-disk file locations                                  |
 
+See [docs/architecture.md](docs/architecture.md) for the detached-run state
+machine, broker lock ownership, and persistence invariants.
+
 ## Development
 
 ```bash
@@ -338,7 +452,7 @@ go test ./...
 ```
 
 The Makefile also provides `make build` and `make build-all` on systems with
-`make`. Corv targets Go 1.25+ with automatic toolchain selection; CI and
+`make`. Corv targets Go 1.26.8; CI and
 release builds use the version pinned in `go.mod` on Linux, macOS, and Windows.
 
 ## License

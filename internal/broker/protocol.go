@@ -19,6 +19,7 @@ const (
 	OpPing     Op = "ping"     // liveness check
 	OpExec     Op = "exec"     // run a command on a profile
 	OpOutput   Op = "output"   // read a completed run log
+	OpJobs     Op = "jobs"     // list active and retained runs
 	OpClose    Op = "close"    // drop a profile's held connection
 	OpList     Op = "list"     // list held connections
 	OpStatus   Op = "status"   // describe held connections
@@ -34,6 +35,7 @@ type Request struct {
 	Command []string `json:"command,omitempty"`
 	RunID   string   `json:"run_id,omitempty"`
 	Pattern string   `json:"pattern,omitempty"`
+	RunKey  string   `json:"run_key,omitempty"`
 	// Wait carries the client's CORV_WAIT value so the synchronous wait window
 	// can be set per invocation instead of only when the broker starts.
 	Wait string `json:"wait,omitempty"`
@@ -57,6 +59,7 @@ type Response struct {
 	Truncated       bool       `json:"truncated,omitempty"`
 	RunMetadata     bool       `json:"run_metadata,omitempty"`
 	OutputTruncated bool       `json:"output_truncated,omitempty"`
+	Lossy           bool       `json:"lossy,omitempty"`
 	OriginalBytes   int64      `json:"original_bytes,omitempty"`
 	SavedBytes      int64      `json:"saved_bytes,omitempty"`
 	ReturnedBytes   int64      `json:"returned_bytes,omitempty"`
@@ -65,6 +68,20 @@ type Response struct {
 	Held []HeldInfo `json:"held,omitempty"`
 	// Connections describes active connections, for OpStatus.
 	Connections []StatusInfo `json:"connections,omitempty"`
+	// Runs lists active and recently retained detached runs.
+	Runs []RunInfo `json:"runs,omitempty"`
+}
+
+// RunInfo describes one detached run without exposing connection details.
+type RunInfo struct {
+	RunID      string     `json:"run_id"`
+	Connection string     `json:"connection"`
+	Status     string     `json:"status"`
+	Running    bool       `json:"running"`
+	ExitCode   *int       `json:"exit_code,omitempty"`
+	StartedAt  time.Time  `json:"started_at"`
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	Truncated  bool       `json:"truncated,omitempty"`
 }
 
 // StatusInfo describes one warm connection and its active work.

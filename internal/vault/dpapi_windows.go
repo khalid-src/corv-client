@@ -3,6 +3,7 @@
 package vault
 
 import (
+	"fmt"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -53,7 +54,7 @@ func unprotect(data []byte) ([]byte, error) {
 		uintptr(unsafe.Pointer(&out)),
 	)
 	if r == 0 {
-		return nil, err
+		return nil, fmt.Errorf("%w: Windows DPAPI could not decrypt the local vault key; run Corv as the same Windows user and profile that created it, or verify that the key file is intact: %w", ErrKeyAccess, err)
 	}
 	defer procLocalFree.Call(uintptr(unsafe.Pointer(out.pbData)))
 	return blobBytes(out), nil

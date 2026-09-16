@@ -73,7 +73,7 @@ func (m model) chrome(body, hints string) string {
 
 func (m model) titleBar() string {
 	left := appBar.Render("Corv")
-	right := appBarDim.Render(" The SSH client for AI agents and humans ")
+	right := appBarDim.Render(" The SSH execution layer for AI agents and humans ")
 	gap := ""
 	if m.width > 0 {
 		used := lipgloss.Width(left) + lipgloss.Width(right)

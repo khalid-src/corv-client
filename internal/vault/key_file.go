@@ -13,9 +13,11 @@ import (
 	"github.com/khalid-src/corv-client/internal/atomicfile"
 )
 
+var readOSKey = func(s *Store) ([]byte, bool, error) { return s.osKey() }
+
 func (s *Store) legacyKeyCandidates(create bool) ([]keyCandidate, error) {
 	var candidates []keyCandidate
-	if key, ok := s.osKey(); ok {
+	if key, ok, _ := readOSKey(s); ok {
 		candidates = append(candidates, keyCandidate{backend: keyBackendOS, key: key})
 	}
 	key, err := s.fileKey(false)
@@ -37,10 +39,14 @@ func (s *Store) legacyKeyCandidates(create bool) ([]keyCandidate, error) {
 func (s *Store) keyForBackend(backend string, create bool) (keyCandidate, error) {
 	switch backend {
 	case keyBackendOS:
-		if key, ok := s.osKey(); ok {
+		key, ok, err := readOSKey(s)
+		if err != nil {
+			return keyCandidate{}, fmt.Errorf("%w: %w", ErrKeyAccess, err)
+		}
+		if ok {
 			return keyCandidate{backend: backend, key: key}, nil
 		}
-		return keyCandidate{}, errors.New("vault uses the OS keychain, but its key is unavailable")
+		return keyCandidate{}, fmt.Errorf("%w: vault uses the OS keychain, but its key is unavailable", ErrKeyAccess)
 	case keyBackendFile:
 		key, err := s.fileKey(create)
 		if err != nil {

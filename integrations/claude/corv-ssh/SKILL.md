@@ -39,11 +39,32 @@ For simple commands:
 corv <name> --json -- <command>
 ```
 
+For a mutating command that may be retried after a lost response, use a stable
+non-secret run key:
+
+```bash
+corv <name> --json --run-key change-42 -- <command>
+```
+
+The same key and command reattach to the active run or return its retained
+result. Completed replay records remain for 24 hours; runs without a known
+outcome retain their key. A different command or changed connection state
+returns `run_key_conflict`. If Corv returns `run_expired`, do not retry with a
+new key until the remote effect has been verified; the expired key remains
+reserved and will not execute again. Never put credentials or tokens in a run
+key.
+
+Replay protection is scoped to one local Corv state directory and saved
+connection. Another machine or state directory can execute the same key again.
+Keep the same client state when retrying; run keys do not coordinate a fleet.
+
 Parse the JSON fields: `exit_code`, `stdout`, `stderr`, `highlights`,
 `error_kind`, `running`, `run_id`, `ok`, plus the output-size fields when
 present. The process exit code mirrors the remote command's exit code. `stdout`
 holds the command's combined stdout and stderr (in order); the `stderr` field
 carries Corv-level errors only, so judge success by `ok` and `exit_code`.
+If `lossy` is true, invalid UTF-8 bytes were replaced to keep the JSON valid;
+do not treat the rendered text as byte-exact.
 
 Agent-facing output is always bounded. Large responses preserve their beginning
 and end with a `... N line(s) hidden ...` marker. Corv retains up to 20 MiB per
@@ -75,6 +96,8 @@ plain `--stdin` with non-ASCII text in PowerShell, first set
 After `--`: a single argument runs as a remote shell line
 (`corv web -- "cd /app && git pull"`); multiple arguments are passed as a
 preserved argument vector (`corv web -- sh -lc "cd /app && make"`).
+Detached scripts run under POSIX `sh`. Use POSIX syntax or explicitly invoke an
+available shell such as `bash -lc`.
 
 ## Rules
 
@@ -83,6 +106,10 @@ preserved argument vector (`corv web -- sh -lc "cd /app && make"`).
   lines.
 - Shell state does NOT persist between commands; combine with `&&`
   (e.g. `cd /app && make`).
+- For multi-step operational work (deploys, restarts, incident fixes), change one
+  thing at a time and verify from the host itself before reporting done, e.g.
+  `corv <name> -- curl -s http://localhost/health`. Use `--run-key` for any
+  mutating step you might retry.
 - For non-trivial commands, encode UTF-8 command text as base64 and use
   `corv <name> --json --stdin-base64`.
 - Do not run bare `corv` (the interactive TUI); it needs a real terminal.
@@ -92,12 +119,20 @@ preserved argument vector (`corv web -- sh -lc "cd /app && make"`).
 A command that finishes within the wait window (~60s by default) returns
 synchronously. `CORV_WAIT` sets that window per invocation (it is read from the
 command's environment), as bare seconds (`30`) or a Go duration (`500ms`, `2m`).
-Longer commands return exit code `75`, a `run_id`, and partial
-output. To follow a detached run, poll `corv output <run-id>`; it checks the run
-and finalizes the retained log once complete. Prefer this over re-running the
+Longer commands return exit code `75`, a `run_id`, and bounded partial output.
+To follow a detached run, poll `corv output <run-id>`; while active it returns a
+bounded recent-output snapshot, then finalizes the retained log once complete.
+Prefer this over re-running the
 command: re-running attaches only when the command string is byte-for-byte
 identical, so any difference would start a second run (and re-execute a
 side-effecting command).
+
+Use `corv jobs --json` to recover active and recently retained run IDs. Its
+status is the last locally recorded state. `unknown` means Corv has not recently
+verified the remote state; it does not mean the process stopped. Use `corv
+output <run-id>` to probe it. `expired` means that probe confirmed the remote
+run files are gone, so no exit code is available. Use `corv log --json` when
+structured local command history is needed.
 
 `corv output <run-id>` exits `75` while the run is still active, with the
 remote exit code when it is complete, and `1` for a Corv retrieval/tool error.
@@ -110,7 +145,8 @@ Windows OpenSSH servers.
 
 When `ok` is false, `error_kind` is one of: `auth_failed`, `unknown_host`,
 `unknown_connection`, `bad_request`, `local_error`, `unreachable`, `host_key`,
-`timeout`, `disconnected`, `resource_exhausted`, `ssh_error`.
+`timeout`, `disconnected`, `resource_exhausted`, `run_key_conflict`,
+`run_expired`, `output_unavailable`, `ssh_error`.
 
 ## Manage connections
 
@@ -120,6 +156,8 @@ Only manage connections when the user asks:
 - `corv import [path]`
 - `corv rm <name>`
 - `corv disconnect <name>`
+- `corv output <run-id> [pattern]`
+- `corv jobs`
 - `corv log [name]`
 - `corv doctor [name]`
 - `corv test <name>`
@@ -127,5 +165,7 @@ Only manage connections when the user asks:
 
 If a command fails with `error_kind: local_error` about stored credentials, do
 not run `corv vault reset` yourself. It deletes stored passwords and key
-passphrases. Tell the user about the error and let them decide whether to run
-the recovery command.
+passphrases. Corv's vault is bound to the OS user profile that created it, so a
+sandbox, service account, elevated account, or different login may lack the
+required profile or keychain context. Report that requirement and the original
+error to the user; let them decide whether to run the recovery command.

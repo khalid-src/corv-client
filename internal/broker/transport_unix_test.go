@@ -34,3 +34,39 @@ func TestShortSocketPathPrefersPrivateRuntimeDirectory(t *testing.T) {
 		t.Fatalf("runtime directory mode = %o", info.Mode().Perm())
 	}
 }
+
+func TestListenBrokerEnforcesOwnerOnlyPermissions(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CORV_HOME", home)
+	runDir := filepath.Join(home, "run")
+	if err := os.MkdirAll(runDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(runDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+
+	ln, addr, err := listenBroker()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = ln.Close()
+		cleanupBroker(addr)
+	})
+
+	dirInfo, err := os.Stat(runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dirInfo.Mode().Perm(); got != 0o700 {
+		t.Fatalf("run directory mode = %o, want 700", got)
+	}
+	socketInfo, err := os.Stat(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := socketInfo.Mode().Perm(); got != 0o600 {
+		t.Fatalf("socket mode = %o, want 600", got)
+	}
+}

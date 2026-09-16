@@ -2,6 +2,8 @@ package cli
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/khalid-src/corv-client/internal/audit"
 	"github.com/khalid-src/corv-client/internal/broker"
+	"github.com/khalid-src/corv-client/internal/importstate"
 	"github.com/khalid-src/corv-client/internal/profile"
 	"github.com/khalid-src/corv-client/internal/sshconn"
 	"github.com/khalid-src/corv-client/internal/statelock"
@@ -60,7 +63,6 @@ func cmdAdd(d deps, args []string, stdin io.Reader, stdout, stderr io.Writer) in
 		}
 	}
 
-	ref := "profile:" + p.Name
 	validation := profile.Registry{}
 	if err := validation.Set(p); err != nil {
 		return fail(stderr, err)
@@ -69,13 +71,13 @@ func cmdAdd(d deps, args []string, stdin io.Reader, stdout, stderr io.Writer) in
 	var secret vault.Secret
 	hasSecret := false
 	if p.IdentityFile != "" {
-		if passphrase := readSecret(stdin, stdout, "Key passphrase (leave empty for unencrypted key or agent auth): "); passphrase != "" {
+		if passphrase := readSecret(stdin, stdout, "Key passphrase (blank keeps a saved passphrase; new connections use an unencrypted key/agent): "); passphrase != "" {
 			secret.Passphrase = passphrase
 			hasSecret = true
 		}
 	} else {
 		// Password is read without echo and kept only in the encrypted vault.
-		if password := readSecret(stdin, stdout, "Password (leave empty for key or agent auth): "); password != "" {
+		if password := readSecret(stdin, stdout, "Password (blank keeps a saved password; new connections use key/agent auth): "); password != "" {
 			secret.Password = password
 			hasSecret = true
 		}
@@ -93,32 +95,26 @@ func cmdAdd(d deps, args []string, stdin io.Reader, stdout, stderr io.Writer) in
 			p.SecretRef = existing.SecretRef
 		}
 
-		var restoreSecret func() error
+		var newRef string
 		if hasSecret {
-			previous, previousExists, err := d.secrets.Get(ref)
+			newRef, err = uniqueCredentialRef(p.Name)
 			if err != nil {
-				return fmt.Errorf("read stored credentials for %q: %w", p.Name, err)
-			}
-			if err := d.secrets.Set(ref, secret); err != nil {
 				return err
 			}
-			p.SecretRef = ref
-			restoreSecret = func() error {
-				if previousExists {
-					return d.secrets.Set(ref, previous)
-				}
-				return d.secrets.Delete(ref)
+			if err := d.secrets.Set(newRef, secret); err != nil {
+				return err
 			}
+			p.SecretRef = newRef
 		}
 		if err := reg.Set(p); err != nil {
-			if restoreSecret != nil {
-				return errors.Join(err, restoreSecret())
+			if newRef != "" {
+				return errors.Join(err, d.secrets.Delete(newRef))
 			}
 			return err
 		}
 		if err := d.store.Save(reg); err != nil {
-			if restoreSecret != nil {
-				return errors.Join(err, restoreSecret())
+			if newRef != "" {
+				return errors.Join(err, d.secrets.Delete(newRef))
 			}
 			return err
 		}
@@ -138,6 +134,14 @@ func cmdAdd(d deps, args []string, stdin io.Reader, stdout, stderr io.Writer) in
 	}
 	fmt.Fprintf(stdout, "%s %s -> %s\n", verb, p.Name, p.Target)
 	return 0
+}
+
+func uniqueCredentialRef(name string) (string, error) {
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return "", fmt.Errorf("generate credential reference: %w", err)
+	}
+	return "profile:" + name + ":" + hex.EncodeToString(random), nil
 }
 
 // readSecret reads a secret without echo from a terminal, or a single line
@@ -161,7 +165,7 @@ func readSecret(stdin io.Reader, stdout io.Writer, prompt string) string {
 func reservedCommand(name string) bool {
 	switch name {
 	case "add", "import", "list", "ls", "rm", "remove", "disconnect", "close",
-		"output", "log", "doctor", "test", "status", "vault", "help", "version",
+		"output", "jobs", "log", "doctor", "test", "status", "vault", "help", "version",
 		"__broker", "update", "upgrade", "uninstall":
 		return true
 	}
@@ -182,60 +186,15 @@ func cmdImport(d deps, args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(stderr, err)
 	}
-	added := 0
-	err = statelock.WithLock(func() error {
-		reg, err := d.store.Load()
-		if err != nil {
-			return err
-		}
-		added, err = importInto(d, &reg, imported, stderr)
-		if err != nil {
-			return err
-		}
-		return d.store.Save(reg)
-	})
+	result, err := importstate.Apply(d.store, d.secrets, imported)
 	if err != nil {
 		return fail(stderr, err)
 	}
-	fmt.Fprintf(stdout, "imported %d connection(s)\n", added)
-	return 0
-}
-
-// importInto merges imported connections into reg, storing secrets in the vault.
-// Existing connections are skipped so import is safe to re-run.
-// Shared by the CLI and TUI import flows.
-func importInto(d deps, reg *profile.Registry, imported []profile.Imported, stderr io.Writer) (int, error) {
-	added := 0
-	for _, im := range imported {
-		p := im.Profile
-		if _, exists := reg.Get(p.Name); exists {
-			continue
-		}
-		if p.IdentityFile == "" && im.KeyMaterial != "" {
-			keyPath, err := profile.WriteIdentityFile(p.Name, im.KeyMaterial)
-			if err != nil {
-				fmt.Fprintf(stderr, "corv: skip %s: %v\n", p.Name, err)
-				continue
-			}
-			p.IdentityFile = keyPath
-		}
-		if err := reg.Set(p); err != nil {
-			fmt.Fprintf(stderr, "corv: skip %s: %v\n", p.Name, err)
-			continue
-		}
-		if im.Password != "" || im.Passphrase != "" {
-			ref := "profile:" + p.Name
-			if err := d.secrets.Set(ref, vault.Secret{Password: im.Password, Passphrase: im.Passphrase}); err != nil {
-				return added, err
-			}
-			p.SecretRef = ref
-		}
-		if err := reg.Set(p); err != nil {
-			return added, err
-		}
-		added++
+	for _, warning := range result.Warnings {
+		fmt.Fprintf(stderr, "corv: %s\n", warning)
 	}
-	return added, nil
+	fmt.Fprintf(stdout, "imported %d connection(s)\n", result.Added)
+	return 0
 }
 
 func cmdList(d deps, args []string, stdout, stderr io.Writer) int {
@@ -339,29 +298,40 @@ func cmdLog(d deps, args []string, stdout, stderr io.Writer) int {
 	name := ""
 	tail := 50
 	clear := false
+	asJSON := hasArg(args, "--json")
+	failLog := func(kind string, err error) int {
+		if asJSON {
+			return writeLogErrorJSON(stdout, kind, err)
+		}
+		return fail(stderr, err)
+	}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--clear":
 			clear = true
+		case "--json":
 		case "--tail", "-n":
 			i++
 			if i >= len(args) {
-				return fail(stderr, errors.New("--tail requires a value"))
+				return failLog("bad_request", errors.New("--tail requires a value"))
 			}
 			n, err := strconv.Atoi(args[i])
 			if err != nil || n < 0 {
-				return fail(stderr, fmt.Errorf("invalid tail value: %s", args[i]))
+				return failLog("bad_request", fmt.Errorf("invalid tail value: %s", args[i]))
 			}
 			tail = n
 		default:
 			if name != "" {
-				return fail(stderr, fmt.Errorf("unexpected argument: %s", args[i]))
+				return failLog("bad_request", fmt.Errorf("unexpected argument: %s", args[i]))
 			}
 			name = args[i]
 		}
 	}
 
 	if clear {
+		if asJSON {
+			return failLog("bad_request", errors.New("--json cannot be combined with --clear"))
+		}
 		if name != "" {
 			return fail(stderr, errors.New("--clear wipes the whole audit log; it can't be limited to one connection"))
 		}
@@ -374,13 +344,40 @@ func cmdLog(d deps, args []string, stdout, stderr io.Writer) int {
 
 	entries, err := d.log.Read(name, tail)
 	if err != nil {
-		return fail(stderr, err)
+		return failLog("local_error", err)
+	}
+	if asJSON {
+		if entries == nil {
+			entries = []audit.Entry{}
+		}
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(entries); err != nil {
+			return fail(stderr, err)
+		}
+		return 0
 	}
 	for _, e := range entries {
-		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s",
 			e.StartedAt.Local().Format(time.RFC3339), e.Profile, logStatus(e.ExitCode, e.Error), audit.OneLine(e.Command))
+		if e.RunID != "" {
+			fmt.Fprintf(stdout, "\trun=%s", e.RunID)
+		}
+		fmt.Fprintln(stdout)
 	}
 	return 0
+}
+
+func writeLogErrorJSON(w io.Writer, kind string, err error) int {
+	entries := []audit.Entry{}
+	payload := struct {
+		OK        bool          `json:"ok"`
+		Entries   []audit.Entry `json:"entries"`
+		Error     string        `json:"error"`
+		ErrorKind string        `json:"error_kind"`
+	}{OK: false, Entries: entries, Error: err.Error(), ErrorKind: kind}
+	_ = json.NewEncoder(w).Encode(payload)
+	return 1
 }
 
 func logStatus(exitCode int, err string) string {
@@ -397,21 +394,21 @@ func cmdOutput(args []string, stdout, stderr io.Writer) int {
 	asJSON, runID, pattern, err := parseOutputArgs(args)
 	if err != nil {
 		if asJSON {
-			return writeOutputJSON(stdout, broker.Response{OK: false, RunID: runID, Error: err.Error()})
+			return writeOutputJSON(stdout, broker.Response{OK: false, RunID: runID, Error: err.Error(), Kind: "bad_request"})
 		}
 		return fail(stderr, err)
 	}
 	self, err := os.Executable()
 	if err != nil {
 		if asJSON {
-			return writeOutputJSON(stdout, broker.Response{OK: false, RunID: runID, Error: err.Error()})
+			return writeOutputJSON(stdout, broker.Response{OK: false, RunID: runID, Error: err.Error(), Kind: "local_error"})
 		}
 		return fail(stderr, err)
 	}
 	resp, err := broker.NewClient(self).Output(runID, pattern)
 	if err != nil {
 		if asJSON {
-			return writeOutputJSON(stdout, broker.Response{OK: false, RunID: runID, Error: fmt.Sprintf("broker: %v", err)})
+			return writeOutputJSON(stdout, broker.Response{OK: false, RunID: runID, Error: fmt.Sprintf("broker: %v", err), Kind: "disconnected"})
 		}
 		return fail(stderr, fmt.Errorf("broker: %w", err))
 	}
@@ -469,15 +466,16 @@ func writeOutputJSON(stdout io.Writer, resp broker.Response) int {
 		"run_id":     resp.RunID,
 		"stdout":     resp.Stdout,
 		"highlights": highlights,
+		"error_kind": resp.Kind,
 		"ok":         resp.OK,
 		"running":    resp.Running,
 		"exit_code":  outputExitCode(resp),
 	}
+	if resp.DurationMS > 0 {
+		payload["duration_ms"] = resp.DurationMS
+	}
 	if resp.Error != "" {
 		payload["error"] = resp.Error
-	}
-	if resp.Kind != "" {
-		payload["error_kind"] = resp.Kind
 	}
 	if resp.RunMetadata {
 		payload["connection"] = resp.Connection
@@ -493,6 +491,9 @@ func writeOutputJSON(stdout io.Writer, resp broker.Response) int {
 }
 
 func addOutputMetadata(payload map[string]any, resp broker.Response) {
+	if resp.Lossy {
+		payload["lossy"] = true
+	}
 	if resp.RunMetadata || resp.ReturnedBytes > 0 || resp.Stdout != "" {
 		payload["returned_bytes"] = resp.ReturnedBytes
 	}
@@ -539,11 +540,14 @@ func cmdDoctor(d deps, args []string, stdout, stderr io.Writer) int {
 	}
 
 	self, _ := os.Executable()
-	client := broker.NewClient(self)
+	client := newDoctorClient(self)
 
 	var held []broker.HeldInfo
-	running, connections, _ := client.Status()
-	if running {
+	running, connections, brokerErr := client.Status()
+	brokerOK := brokerErr == nil
+	if brokerErr != nil {
+		fmt.Fprintf(stdout, "broker:           unavailable (%s)\n", doctorLocalError(brokerErr, full))
+	} else if running {
 		for _, connection := range connections {
 			held = append(held, broker.HeldInfo{
 				Name:   connection.Name,
@@ -555,9 +559,46 @@ func cmdDoctor(d deps, args []string, stdout, stderr io.Writer) int {
 	} else {
 		fmt.Fprintln(stdout, "broker:           not running (starts on first command)")
 	}
-	fmt.Fprintf(stdout, "config:           %s\n", presentLabel(d.paths.ConfigFile))
-	fmt.Fprintf(stdout, "audit log:        %s\n", presentLabel(d.paths.AuditFile))
+	configState, configOK := presentLabel(d.paths.ConfigFile, full)
+	auditState, auditOK := presentLabel(d.paths.AuditFile, full)
+	fmt.Fprintf(stdout, "config:           %s\n", configState)
+	fmt.Fprintf(stdout, "audit log:        %s\n", auditState)
 	fmt.Fprintln(stdout, "remote footprint: temporary files for detached runs only")
+
+	reg, stateErr := d.store.LoadReadOnly()
+	vaultOK := stateErr == nil
+	if stateErr != nil {
+		fmt.Fprintf(stdout, "vault:            unreadable (%s)\n", doctorVaultError(stateErr, full))
+	} else {
+		refs := make(map[string]struct{})
+		for _, p := range reg.Profiles {
+			if p.SecretRef != "" {
+				refs[p.SecretRef] = struct{}{}
+			}
+		}
+		if len(refs) == 0 {
+			fmt.Fprintln(stdout, "vault:            not used (no stored credentials)")
+		} else {
+			for ref := range refs {
+				_, ok, err := d.secrets.Get(ref)
+				if err != nil {
+					stateErr = err
+					vaultOK = false
+					break
+				}
+				if !ok {
+					stateErr = errors.New("a saved connection refers to a credential that is missing")
+					vaultOK = false
+					break
+				}
+			}
+			if vaultOK {
+				fmt.Fprintln(stdout, "vault:            readable")
+			} else {
+				fmt.Fprintf(stdout, "vault:            unreadable (%s)\n", doctorVaultError(stateErr, full))
+			}
+		}
+	}
 
 	for _, h := range held {
 		if full {
@@ -573,12 +614,14 @@ func cmdDoctor(d deps, args []string, stdout, stderr io.Writer) int {
 	}
 
 	if name == "" {
+		if !vaultOK || !brokerOK || !configOK || !auditOK {
+			return 1
+		}
 		return 0
 	}
 
-	reg, err := d.store.Load()
-	if err != nil {
-		return fail(stderr, err)
+	if !vaultOK || !brokerOK || !configOK || !auditOK {
+		return 1
 	}
 	p, ok := reg.Get(name)
 	if !ok {
@@ -599,9 +642,33 @@ func cmdDoctor(d deps, args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func presentLabel(path string) string {
-	if _, err := os.Stat(path); err == nil {
-		return "present"
+func doctorVaultError(err error, full bool) string {
+	if full {
+		return err.Error()
 	}
-	return "missing"
+	if errors.Is(err, vault.ErrKeyAccess) {
+		return "the vault key is unavailable to this process context; use --full for details"
+	}
+	if errors.Is(err, profile.ErrConfigUnreadable) {
+		return "the vault key is unavailable or encrypted local state is damaged; use --full for details"
+	}
+	return "stored local state could not be read; use --full for details"
+}
+
+func presentLabel(path string, full bool) (string, bool) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return "present", true
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return "missing", true
+	}
+	return "unavailable (" + doctorLocalError(err, full) + ")", false
+}
+
+func doctorLocalError(err error, full bool) string {
+	if full {
+		return err.Error()
+	}
+	return "local state could not be inspected; use --full for details"
 }

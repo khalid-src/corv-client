@@ -16,11 +16,10 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: "1.26.5"
-          check-latest: true
+          go-version: "1.26.8"
       - name: Build
         run: go build ./...
       - name: Vet
@@ -36,7 +35,7 @@ jobs:
       - name: Test with race detector
         run: go test -race -count=1 ./...
       - name: Vulnerability scan
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
       - name: Release notes
         run: test -f "docs/releases/${GITHUB_REF_NAME}.md"
 
@@ -46,11 +45,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: "1.26.5"
-          check-latest: true
+          go-version: "1.26.8"
 
       - name: Build binaries
         env:
@@ -66,7 +64,7 @@ jobs:
           (cd dist && sha256sum corv-* > SHA256SUMS)
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/*
           body_path: docs/releases/${{ github.ref_name }}.md

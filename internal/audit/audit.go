@@ -2,8 +2,10 @@ package audit
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +23,7 @@ type Entry struct {
 	DurationMS int64     `json:"duration_ms"`
 	Error      string    `json:"error,omitempty"`
 	RunID      string    `json:"run_id,omitempty"`
+	Status     string    `json:"status,omitempty"`
 }
 
 type Log struct {
@@ -88,29 +91,154 @@ func (l *Log) read(profile string, tail int) ([]Entry, error) {
 	}
 	defer file.Close()
 
-	var entries []Entry
-	// A bufio.Reader has no token-size limit, so one oversized historical line
-	// (e.g. a logged large command) is read and skipped rather than failing the
-	// whole view, which a bufio.Scanner would do with ErrTooLong.
-	reader := bufio.NewReader(file)
-	for {
-		line, readErr := reader.ReadString('\n')
-		if len(line) > 0 {
-			var entry Entry
-			if json.Unmarshal([]byte(strings.TrimRight(line, "\n")), &entry) == nil {
-				if profile == "" || entry.Profile == profile {
-					entries = append(entries, entry)
-				}
+	if tail > 0 {
+		entries := make([]Entry, 0, tail)
+		err := scanEntriesReverse(file, func(entry Entry) bool {
+			if profile == "" || entry.Profile == profile {
+				entries = append(entries, entry)
 			}
+			return len(entries) < tail
+		})
+		if err != nil {
+			return nil, err
 		}
-		if readErr != nil {
-			break
+		for left, right := 0, len(entries)-1; left < right; left, right = left+1, right-1 {
+			entries[left], entries[right] = entries[right], entries[left]
 		}
+		return entries, nil
 	}
-	if tail > 0 && len(entries) > tail {
-		entries = entries[len(entries)-tail:]
+
+	var entries []Entry
+	err = scanEntries(file, func(entry Entry) {
+		if profile == "" || entry.Profile == profile {
+			entries = append(entries, entry)
+		}
+	})
+	if err != nil {
+		return nil, err
 	}
 	return entries, nil
+}
+
+const maxAuditLineBytes = 8 << 20
+
+func scanEntries(input io.Reader, visit func(Entry)) error {
+	reader := bufio.NewReader(input)
+	line := make([]byte, 0, 4096)
+	oversized := false
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		if !oversized {
+			if len(line)+len(fragment) > maxAuditLineBytes {
+				line = line[:0]
+				oversized = true
+			} else {
+				line = append(line, fragment...)
+			}
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		if !oversized && len(line) > 0 {
+			line = bytes.TrimSuffix(line, []byte{'\n'})
+			line = bytes.TrimSuffix(line, []byte{'\r'})
+			var entry Entry
+			if json.Unmarshal(line, &entry) == nil {
+				visit(entry)
+			}
+		}
+		line = line[:0]
+		oversized = false
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+	}
+}
+
+func scanEntriesReverse(file *os.File, visit func(Entry) bool) error {
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	const blockSize = 64 * 1024
+	position := info.Size()
+	var segments [][]byte
+	segmentBytes := 0
+	droppingOversized := false
+	visitLine := func(prefix []byte) bool {
+		lineSize := len(prefix) + segmentBytes
+		if lineSize > maxAuditLineBytes {
+			return true
+		}
+		line := make([]byte, 0, lineSize)
+		line = append(line, prefix...)
+		for i := len(segments) - 1; i >= 0; i-- {
+			line = append(line, segments[i]...)
+		}
+		entry, ok := decodeEntry(line)
+		return !ok || visit(entry)
+	}
+	for position > 0 {
+		readSize := int64(blockSize)
+		if position < readSize {
+			readSize = position
+		}
+		position -= readSize
+		block := make([]byte, int(readSize))
+		n, err := file.ReadAt(block, position)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		block = block[:n]
+		end := len(block)
+		for {
+			newline := bytes.LastIndexByte(block[:end], '\n')
+			if newline < 0 {
+				break
+			}
+			if droppingOversized {
+				droppingOversized = false
+			} else if !visitLine(block[newline+1 : end]) {
+				return nil
+			}
+			segments = nil
+			segmentBytes = 0
+			end = newline
+		}
+		if droppingOversized {
+			continue
+		}
+		if end > 0 {
+			segment := append([]byte(nil), block[:end]...)
+			segments = append(segments, segment)
+			segmentBytes += len(segment)
+		}
+		if segmentBytes > maxAuditLineBytes {
+			segments = nil
+			segmentBytes = 0
+			droppingOversized = true
+		}
+	}
+	if !droppingOversized {
+		visitLine(nil)
+	}
+	return nil
+}
+
+func decodeEntry(line []byte) (Entry, bool) {
+	line = bytes.TrimSuffix(line, []byte{'\n'})
+	line = bytes.TrimSuffix(line, []byte{'\r'})
+	if len(line) == 0 {
+		return Entry{}, false
+	}
+	var entry Entry
+	if json.Unmarshal(line, &entry) != nil {
+		return Entry{}, false
+	}
+	return entry, true
 }
 
 // Complete appends the terminal outcome for a previously recorded detached run.
@@ -120,20 +248,31 @@ func (l *Log) Complete(runID string, startedAt, finishedAt time.Time, exitCode i
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	entries, err := l.read("", 0)
+	file, err := os.Open(l.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
+	defer file.Close()
 	var started *Entry
-	for i := range entries {
-		entry := &entries[i]
+	err = scanEntriesReverse(file, func(entry Entry) bool {
 		if entry.RunID != runID {
-			continue
+			return true
 		}
-		if entry.ExitCode != 75 {
-			return nil
+		if entry.Status == "completed" {
+			return false
 		}
-		started = entry
+		if entry.Status == "running" || (entry.Status == "" && entry.ExitCode == 75) {
+			copy := entry
+			started = &copy
+			return false
+		}
+		return entry.Status != ""
+	})
+	if err != nil {
+		return err
 	}
 	if started == nil {
 		return nil
@@ -144,6 +283,7 @@ func (l *Log) Complete(runID string, startedAt, finishedAt time.Time, exitCode i
 	completed.ExitCode = exitCode
 	completed.DurationMS = finishedAt.Sub(startedAt).Milliseconds()
 	completed.Error = ""
+	completed.Status = "completed"
 	return l.append(completed)
 }
 
