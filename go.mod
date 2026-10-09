@@ -3,13 +3,13 @@ module github.com/khalid-src/corv-client
 go 1.26.8
 
 require (
-	github.com/Microsoft/go-winio v0.6.2
+	github.com/Microsoft/go-winio v0.6.3
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/muesli/cancelreader v0.2.2
 	golang.org/x/crypto v0.56.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.48.0
 	golang.org/x/term v0.45.0
 )
 
