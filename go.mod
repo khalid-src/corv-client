@@ -1,6 +1,6 @@
 module github.com/khalid-src/corv-client
 
-go 1.26.8
+go 1.26.10
 
 require (
 	github.com/Microsoft/go-winio v0.6.2
