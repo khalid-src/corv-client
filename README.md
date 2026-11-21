@@ -448,7 +448,7 @@ go test ./...
 ```
 
 The Makefile also provides `make build` and `make build-all` on systems with
-`make`. Corv targets Go 1.26.10; CI and
+`make`. Corv targets Go 1.26.11; CI and
 release builds use the version pinned in `go.mod` on Linux, macOS, and Windows.
 
 ## License

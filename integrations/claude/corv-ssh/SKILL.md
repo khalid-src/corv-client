@@ -1,6 +1,6 @@
 ---
 name: corv-ssh
-description: Run commands on remote machines over SSH via the `corv` CLI (a local SSH client). Use when the user asks to run, check, deploy, restart, or inspect something on a named server/host/VM, or mentions SSH or remote execution.
+description: Run commands on any machine reachable over SSH through the `corv` CLI, the execution layer for AI agents. No tmux, no credentials in the chat. Use when the user asks to run, check, deploy, restart, or inspect something on a named server, host or VM, or mentions SSH or remote execution.
 ---
 
 # Running remote commands with Corv
